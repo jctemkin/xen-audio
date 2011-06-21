@@ -49,6 +49,9 @@
 #include <xs.h>
 
 #include "module-xenpv-sink-symdef.h"
+#include "grant.h"
+
+int alloc_gref(struct ioctl_gntalloc_alloc_gref *gref, void **addr);
 
 PA_MODULE_AUTHOR("Lennart Poettering");
 PA_MODULE_DESCRIPTION("UNIX pipe sink");
@@ -245,7 +248,10 @@ int pa__init(pa_module*m) {
     pa_sink_new_data data;
     char keybuf[128], valbuf[32];
     char *out; int len;
+    void *page;
 
+    int ret;
+    struct ioctl_gntalloc_alloc_gref gref;
     pa_assert(m);
 
     if (!(ma = pa_modargs_new(m->argument, valid_modargs))) {
@@ -275,19 +281,24 @@ int pa__init(pa_module*m) {
         pa_log("xc_evtchn_bind_unbound_port failed");
     }
 
-    //todo: get grant reference
+    //get grant reference & map locally
+    ret = alloc_gref(&gref, &page);
+
     //post event chan & grant reference to xenstore
     snprintf(keybuf, sizeof keybuf, "device/audio/%d/event-channel", DEVID);
     snprintf(valbuf, sizeof valbuf, "%d", event_channel_port);
     xs_write(xsh, 0, keybuf, valbuf, strlen(valbuf));
-
+    snprintf(keybuf, sizeof keybuf, "device/audio/%d/ring-ref", DEVID);
+    snprintf(valbuf, sizeof valbuf, "%d", gref.gref_ids[0]);
+    xs_write(xsh, 0, keybuf, valbuf, strlen(valbuf));
 
     //wait for backend to connect
-    xc_evtchn_pending(event_channel_port);
-    //sleep(10);
+    //xc_evtchn_pending(event_channel_port);
+    sleep(10);
     //send notification
     xc_evtchn_notify(xce, event_channel_port);
 
+    puts(page);
     goto fail; ///////////////testing
 
     /*
@@ -457,4 +468,47 @@ void pa__done(pa_module*m) {
     xc_evtchn_close(xce);
     xc_interface_close(xch);
     xs_daemon_close(xsh);
+}
+
+
+int alloc_gref(struct ioctl_gntalloc_alloc_gref *gref, void **addr)
+{
+        int alloc_fd, dev_fd, rv;
+       	alloc_fd = open("/dev/xen/gntalloc", O_RDWR);
+	dev_fd = open("/dev/xen/gntdev", O_RDWR);
+
+        /*use dom0*/
+        gref->domid = 0;
+        gref->flags = GNTALLOC_FLAG_WRITABLE;
+        gref->count = 1;
+
+        rv = ioctl(alloc_fd, IOCTL_GNTALLOC_ALLOC_GREF, gref);
+	if (rv) {
+		printf("src-add error: %s (rv=%d)\n", strerror(errno), rv);
+		return rv;
+	}
+
+                        /*addr=NULL(default),length, prot,             flags,    fd,   offset*/
+	*addr = mmap(0, 4096, PROT_READ|PROT_WRITE, MAP_SHARED, alloc_fd, gref->index);
+	if (*addr == MAP_FAILED) {
+		*addr = 0;
+		printf("mmap failed: SHOULD NOT HAPPEN\n");
+		return rv;
+	}
+
+	printf("Got grant #%d. Mapped locally at %Ld=%p\n",
+		gref->gref_ids[0], gref->index, *addr);
+
+        /* skip this for now
+	struct ioctl_gntalloc_unmap_notify uarg = {
+		.index = gref->index + offsetof(struct shr_page, notifies[0]),
+		.action = UNMAP_NOTIFY_CLEAR_BYTE
+	};
+
+	rv = ioctl(a_fd, IOCTL_GNTALLOC_SET_UNMAP_NOTIFY, &uarg);
+	if (rv)
+		printf("gntalloc unmap notify error: %s (rv=%d)\n", strerror(errno), rv);
+        */
+
+        return rv;
 }
