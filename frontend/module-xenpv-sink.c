@@ -51,8 +51,6 @@
 #include "module-xenpv-sink-symdef.h"
 #include "grant.h"
 
-int alloc_gref(struct ioctl_gntalloc_alloc_gref *gref, void **addr);
-
 PA_MODULE_AUTHOR("Lennart Poettering");
 PA_MODULE_DESCRIPTION("UNIX pipe sink");
 PA_MODULE_VERSION(PACKAGE_VERSION);
@@ -93,9 +91,9 @@ struct userdata {
 
 struct ring {
     uint8_t buffer[2048];
-    uint32_t cons_idx, prod_indx;
+    uint32_t cons_indx, prod_indx;
     //rest of variables
-};
+} *ioring;
 
 static const char* const valid_modargs[] = {
     "sink_name",
@@ -109,9 +107,14 @@ static const char* const valid_modargs[] = {
 };
 
 /*xc_evtchn_t, xc_interface */
-static int xch, xce, event_channel_port;
+static int xch, xce, xen_evtchn_port;
 static struct xs_handle *xsh;
 
+int total_bytes;
+
+int alloc_gref(struct ioctl_gntalloc_alloc_gref *gref, void **addr);
+int ring_write(struct ring *r, void *src, int length);
+int ring_wait_for_event();
 
 static int sink_process_msg(pa_msgobject *o, int code, void *data, int64_t offset, pa_memchunk *chunk) {
     struct userdata *u = PA_SINK(o)->userdata;
@@ -151,7 +154,8 @@ static int process_render(struct userdata *u) {
 
         p = pa_memblock_acquire(u->memchunk.memblock);
 	//xen: write data to ring buffer & notify backend
-        l = pa_write(u->fd, (uint8_t*) p + u->memchunk.index, u->memchunk.length, &u->write_type);
+        //l = pa_write(u->fd, (uint8_t*) p + u->memchunk.index, u->memchunk.length, &u->write_type);
+        l = ring_write(ioring, (uint8_t*)p + u->memchunk.index, u->memchunk.length);
         pa_memblock_release(u->memchunk.memblock);
 
         pa_assert(l != 0);
@@ -248,8 +252,8 @@ int pa__init(pa_module*m) {
     pa_sink_new_data data;
     char keybuf[128], valbuf[32];
     char *out; int len;
-    void *page;
 
+    total_bytes = 0;
     int ret;
     struct ioctl_gntalloc_alloc_gref gref;
     pa_assert(m);
@@ -276,17 +280,17 @@ int pa__init(pa_module*m) {
         goto fail;
     }
     //use only dom0 as the backend for now
-    event_channel_port = xc_evtchn_bind_unbound_port(xce, 0);
-    if(event_channel_port<0){
+    xen_evtchn_port = xc_evtchn_bind_unbound_port(xce, 0);
+    if(xen_evtchn_port<0){
         pa_log("xc_evtchn_bind_unbound_port failed");
     }
 
     //get grant reference & map locally
-    ret = alloc_gref(&gref, &page);
+    ret = alloc_gref(&gref, (void**)&ioring);
 
     //post event chan & grant reference to xenstore
     snprintf(keybuf, sizeof keybuf, "device/audio/%d/event-channel", DEVID);
-    snprintf(valbuf, sizeof valbuf, "%d", event_channel_port);
+    snprintf(valbuf, sizeof valbuf, "%d", xen_evtchn_port);
     xs_write(xsh, 0, keybuf, valbuf, strlen(valbuf));
     snprintf(keybuf, sizeof keybuf, "device/audio/%d/ring-ref", DEVID);
     snprintf(valbuf, sizeof valbuf, "%d", gref.gref_ids[0]);
@@ -294,12 +298,12 @@ int pa__init(pa_module*m) {
 
     //wait for backend to connect
     //xc_evtchn_pending(event_channel_port);
-    sleep(10);
+    //sleep(10);
     //send notification
-    xc_evtchn_notify(xce, event_channel_port);
+    //xc_evtchn_notify(xce, xen_evtchn_port);
 
-    puts(page);
-    goto fail; ///////////////testing
+    //puts(ioring->buffer);
+    //goto fail; ///////////////testing
 
     /*
     snprintf(keybuf, sizeof keybuf, "device/audio/%d/ring-ref", DEVID);
@@ -332,10 +336,11 @@ int pa__init(pa_module*m) {
     pa_thread_mq_init(&u->thread_mq, m->core->mainloop, u->rtpoll);
     u->write_type = 0;
 
-    u->filename = pa_runtime_path(pa_modargs_get_value(ma, "file", DEFAULT_FILE_NAME));
+    //u->filename = pa_runtime_path(pa_modargs_get_value(ma, "file", DEFAULT_FILE_NAME));
 
     //todo xen : init ring buffer
-    mkfifo(u->filename, 0666);
+    ioring->prod_indx = ioring->cons_indx = 0;
+    /*mkfifo(u->filename, 0666);
     if ((u->fd = open(u->filename, O_RDWR|O_NOCTTY)) < 0) {
         pa_log("open('%s'): %s", u->filename, pa_cstrerror(errno));
         goto fail;
@@ -353,12 +358,12 @@ int pa__init(pa_module*m) {
         pa_log("'%s' is not a FIFO.", u->filename);
         goto fail;
     }
-//
+*/
     pa_sink_new_data_init(&data);
     data.driver = __FILE__;
     data.module = m;
     pa_sink_new_data_set_name(&data, pa_modargs_get_value(ma, "sink_name", DEFAULT_SINK_NAME));
-    pa_proplist_sets(data.proplist, PA_PROP_DEVICE_STRING, u->filename);
+    pa_proplist_sets(data.proplist, PA_PROP_DEVICE_STRING, "xensink");//u->filename);
     pa_proplist_setf(data.proplist, PA_PROP_DEVICE_DESCRIPTION, "Unix FIFO sink %s", u->filename);
     pa_sink_new_data_set_sample_spec(&data, &ss);
     pa_sink_new_data_set_channel_map(&data, &map);
@@ -382,13 +387,13 @@ int pa__init(pa_module*m) {
 
     pa_sink_set_asyncmsgq(u->sink, u->thread_mq.inq);
     pa_sink_set_rtpoll(u->sink, u->rtpoll);
-    pa_sink_set_max_request(u->sink, pa_pipe_buf(u->fd));
-    pa_sink_set_fixed_latency(u->sink, pa_bytes_to_usec(pa_pipe_buf(u->fd), &u->sink->sample_spec));
+    //pa_sink_set_max_request(u->sink, pa_pipe_buf(u->fd));
+    //pa_sink_set_fixed_latency(u->sink, pa_bytes_to_usec(pa_pipe_buf(u->fd), &u->sink->sample_spec));
 
     u->rtpoll_item = pa_rtpoll_item_new(u->rtpoll, PA_RTPOLL_NEVER, 1);
-    pollfd = pa_rtpoll_item_get_pollfd(u->rtpoll_item, NULL);
-    pollfd->fd = u->fd;
-    pollfd->events = pollfd->revents = 0;
+    //pollfd = pa_rtpoll_item_get_pollfd(u->rtpoll_item, NULL);
+    //pollfd->fd = u->fd;
+    //pollfd->events = pollfd->revents = 0;
 
     if (!(u->thread = pa_thread_new(thread_func, u))) {
         pa_log("Failed to create thread.");
@@ -510,5 +515,76 @@ int alloc_gref(struct ioctl_gntalloc_alloc_gref *gref, void **addr)
 		printf("gntalloc unmap notify error: %s (rv=%d)\n", strerror(errno), rv);
         */
 
+        close(alloc_fd);
+        close(dev_fd);
+
         return rv;
 }
+
+int ring_write(struct ring *r, void *src, int length)
+{
+    if(length<0) return length;
+    int ring_free_bytes = (sizeof(r->buffer) - (r->prod_indx-r->cons_indx) -1) % sizeof(r->buffer);
+    //free space may be split over the end of the buffer
+    int first_chunk_size = (sizeof(r->buffer)-r->prod_indx);
+    int second_chunk_size = (r->cons_indx>=r->prod_indx)? (r->cons_indx) : 0;
+    int l, fl, sl;
+
+    //full?
+    if(ring_free_bytes==0) {
+        printf("XEN: Buffer is full: bufsize:%d prod_indx:%d consindx:%d, free:%d total:%d\n", sizeof(r->buffer), r->prod_indx, r->cons_indx,ring_free_bytes, total_bytes);
+        xc_evtchn_notify(xce, xen_evtchn_port);
+        usleep(100);
+        return ring_wait_for_event(ioring);
+        //return EINTR;
+    }
+
+    //calculate lengths in case of a split buffer
+    l = PA_MIN(ring_free_bytes, length);
+    fl = PA_MIN(l, first_chunk_size);
+    sl = PA_MIN(l-fl, second_chunk_size);
+
+    //copy to both chunks
+    printf("XEN: Copying chunks: bufsize:%d prod_indx:%d consindx:%d, free:%d, total:%d\n", sizeof(r->buffer), r->prod_indx, r->cons_indx, ring_free_bytes, total_bytes);
+    printf("XEN: Copying chunks: l%d fl:%d sl%d length:%d\n",l,fl,sl,length);
+    memcpy(r->buffer+r->prod_indx, src, fl);
+    if(sl) memcpy(r->buffer, src+fl, sl);
+    r->prod_indx = (r->prod_indx+fl+sl) % sizeof(r->buffer);
+
+    total_bytes += sl+fl;
+    return sl+fl;
+}
+
+int ring_wait_for_event()
+{
+        puts("XEN:Blocking");
+        fflush(stdout);
+	fd_set readfds;
+	int xcefd, ret;
+	struct timeval timeout;
+
+	xcefd = xc_evtchn_fd(xce);
+	FD_ZERO(&readfds);
+	FD_SET(xcefd, &readfds);
+
+	xc_evtchn_unmask(xce, xen_evtchn_port);
+
+	timeout.tv_sec=1000;
+	timeout.tv_usec=0;
+
+	ret = select(xcefd+1, &readfds, NULL, NULL, &timeout);
+        xc_evtchn_pending(xce);
+
+	if(ret==-1) {
+            perror("select() returned error while waiting for backend");
+            return ret;
+        }
+	else if(ret && FD_ISSET(xcefd, &readfds)){
+            return EAGAIN; //OK
+        }
+	else{
+            perror("select() timed out while waiting for backend\n");
+            return 0;
+        }
+}
+
