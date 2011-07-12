@@ -1,5 +1,5 @@
 CC=gcc
-LIBS=-lxenctrl -lxenstore -lpulse-simple
+LIBS=-lxenctrl -lxenstore -lpulse-simple -lpulse
 CFLAGS=-I./pulseaudio/src
 all: backend
 

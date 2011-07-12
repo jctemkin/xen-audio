@@ -89,8 +89,10 @@ struct userdata {
     int write_type;
 };
 
+#define BUFSIZE 2048
+
 struct ring {
-    uint8_t buffer[2048];
+    uint8_t buffer[BUFSIZE];
     uint32_t cons_indx, prod_indx;
     //rest of variables
 } *ioring;
@@ -153,9 +155,9 @@ static int process_render(struct userdata *u) {
         void *p;
 
         p = pa_memblock_acquire(u->memchunk.memblock);
-	//xen: write data to ring buffer & notify backend
-        //l = pa_write(u->fd, (uint8_t*) p + u->memchunk.index, u->memchunk.length, &u->write_type);
+	    //xen: write data to ring buffer & notify backend
         l = ring_write(ioring, (uint8_t*)p + u->memchunk.index, u->memchunk.length);
+        xc_evtchn_notify(xce, xen_evtchn_port);
         pa_memblock_release(u->memchunk.memblock);
 
         pa_assert(l != 0);
@@ -216,6 +218,7 @@ static void thread_func(void *userdata) {
         }
 
         /* Hmm, nothing to do. Let's sleep */
+
         pollfd->events = (short) (u->sink->thread_info.state == PA_SINK_RUNNING ? POLLOUT : 0);
 
         if ((ret = pa_rtpoll_run(u->rtpoll, TRUE)) < 0)
@@ -269,12 +272,12 @@ int pa__init(pa_module*m) {
         pa_log("xs_domain_open failed");
         goto fail;
     }
-    xch = xc_interface_open();
+    xch = xc_interface_open(NULL, NULL, 0);
     if(xch==0){
         pa_log("xc_interface_open failed");
         goto fail;
     }
-    xce = xc_evtchn_open();
+    xce = xc_evtchn_open(NULL, 0);
     if(xce==0){
         pa_log("xc_evtchn_open failed");
         goto fail;
@@ -523,7 +526,6 @@ int alloc_gref(struct ioctl_gntalloc_alloc_gref *gref, void **addr)
 
 int ring_write(struct ring *r, void *src, int length)
 {
-    if(length<0) return length;
     int ring_free_bytes = (sizeof(r->buffer) - (r->prod_indx-r->cons_indx) -1) % sizeof(r->buffer);
     //free space may be split over the end of the buffer
     int first_chunk_size = (sizeof(r->buffer)-r->prod_indx);
@@ -532,11 +534,12 @@ int ring_write(struct ring *r, void *src, int length)
 
     //full?
     if(ring_free_bytes==0) {
-        printf("XEN: Buffer is full: bufsize:%d prod_indx:%d consindx:%d, free:%d total:%d\n", sizeof(r->buffer), r->prod_indx, r->cons_indx,ring_free_bytes, total_bytes);
-        xc_evtchn_notify(xce, xen_evtchn_port);
-        usleep(100);
-        return ring_wait_for_event(ioring);
-        //return EINTR;
+        //printf("XEN: Buffer is full: bufsize:%d prod_indx:%d consindx:%d, free:%d total:%d\n", sizeof(r->buffer), r->prod_indx, r->cons_indx,ring_free_bytes, total_bytes);
+        //xc_evtchn_notify(xce, xen_evtchn_port);
+        //usleep(10);
+        //return EAGAIN;// ring_wait_for_event(ioring);
+        errno = EINTR;
+        return -1;
     }
 
     //calculate lengths in case of a split buffer
@@ -545,13 +548,15 @@ int ring_write(struct ring *r, void *src, int length)
     sl = PA_MIN(l-fl, second_chunk_size);
 
     //copy to both chunks
-    printf("XEN: Copying chunks: bufsize:%d prod_indx:%d consindx:%d, free:%d, total:%d\n", sizeof(r->buffer), r->prod_indx, r->cons_indx, ring_free_bytes, total_bytes);
-    printf("XEN: Copying chunks: l%d fl:%d sl%d length:%d\n",l,fl,sl,length);
+    //printf("XEN: Copying chunks: bufsize:%d prod_indx:%d consindx:%d, free:%d, total:%d\n", sizeof(r->buffer), r->prod_indx, r->cons_indx, ring_free_bytes, total_bytes);
+    //printf("XEN: Copying chunks: l%d fl:%d sl%d length:%d\n",l,fl,sl,length);
     memcpy(r->buffer+r->prod_indx, src, fl);
-    if(sl) memcpy(r->buffer, src+fl, sl);
+    if(sl)
+        memcpy(r->buffer, src+fl, sl);
     r->prod_indx = (r->prod_indx+fl+sl) % sizeof(r->buffer);
 
     total_bytes += sl+fl;
+    usleep(1000);
     return sl+fl;
 }
 

@@ -1,6 +1,6 @@
 CC=gcc
-LIBS=-lxenctrl -lxenstore
-CFLAGS=-fPIC -I./pulseaudio/src
+LIBS=-L/usr/lib/xen-4.1/lib -lxenctrl -lxenstore
+CFLAGS= -fPIC -I./pulseaudio/src
 all: module-xenpv-sink.so
 
 module-xenpv-sink.so: module-xenpv-sink.o
