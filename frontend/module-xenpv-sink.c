@@ -68,6 +68,29 @@ PA_MODULE_USAGE(
 #define DEFAULT_SINK_NAME "fifo_output"
 
 #define DEVID 0
+enum xenbus_state
+{
+	XenbusStateUnknown      = 0,
+	XenbusStateInitialising = 1,
+	XenbusStateInitWait     = 2,  /* Finished early
+					 initialisation, but waiting
+					 for information from the peer
+					 or hotplug scripts. */
+	XenbusStateInitialised  = 3,  /* Initialised and waiting for a
+					 connection from the peer. */
+	XenbusStateConnected    = 4,
+	XenbusStateClosing      = 5,  /* The device is being closed
+					 due to an error or an unplug
+					 event. */
+	XenbusStateClosed       = 6,
+
+	/*
+	* Reconfiguring: The device is being reconfigured.
+	*/
+	XenbusStateReconfiguring = 7,
+
+	XenbusStateReconfigured  = 8
+};
 
 struct userdata {
     pa_core *core;
@@ -117,6 +140,8 @@ int total_bytes;
 int alloc_gref(struct ioctl_gntalloc_alloc_gref *gref, void **addr);
 int ring_write(struct ring *r, void *src, int length);
 int ring_wait_for_event();
+int publish_spec(pa_sample_spec *ss);
+int read_backend_spec(pa_sample_spec *ss);
 
 static int sink_process_msg(pa_msgobject *o, int code, void *data, int64_t offset, pa_memchunk *chunk) {
     struct userdata *u = PA_SINK(o)->userdata;
@@ -254,7 +279,10 @@ int pa__init(pa_module*m) {
     struct pollfd *pollfd;
     pa_sink_new_data data;
     char keybuf[128], valbuf[32];
+    char *buf;
     char *out; int len;
+    char **vec;
+    unsigned int frontend_domid, num_strings;
 
     total_bytes = 0;
     int ret;
@@ -299,6 +327,48 @@ int pa__init(pa_module*m) {
     snprintf(valbuf, sizeof valbuf, "%d", gref.gref_ids[0]);
     xs_write(xsh, 0, keybuf, valbuf, strlen(valbuf));
 
+    ss = m->core->default_sample_spec;
+    map = m->core->default_channel_map;
+    if (pa_modargs_get_sample_spec_and_channel_map(ma, &ss, &map, PA_CHANNEL_MAP_DEFAULT) < 0) {
+        pa_log("Invalid sample format specification or channel map");
+        goto fail;
+    }
+    frontend_domid = atoi(xs_read(xsh, 0, "domid", &len));
+
+    //First negotiation phase; post default frontend parameters and wait for backend response
+    snprintf(keybuf, sizeof(keybuf), "/local/domain/0/backend/audio/%d/%d/state", frontend_domid, 0);//gref);
+    if (!xs_watch(xsh, keybuf, "mytoken")) perror("xs_watch");
+    int current_backend_state;
+    publish_spec(&ss);
+
+    int backend_state = 0;
+    //wait for backend to acknowledge reading the sample spec
+    do{
+    //read_backend_state(&state);
+        if(!(vec=xs_read_watch(xsh, &num_strings))) perror("xs_read_watch");
+        printf("vec contents: %s|%s\n", vec[XS_WATCH_PATH], vec[XS_WATCH_TOKEN]);
+        buf = xs_read(xsh, 0, vec[XS_WATCH_PATH], &len);
+        backend_state = atoi(buf);
+    } while(backend_state!=XenbusStateInitialised && backend_state!=XenbusStateReconfiguring);
+    
+    if(backend_state!=XenbusStateInitialised){
+        //backend rejected sample spec
+
+        //simple fallback; accept backend's parameters
+        read_backend_spec(&ss);
+    }
+
+    if(!(vec=xs_read_watch(xsh, &num_strings))) perror("xs_read_watch");
+    printf("vec contents: %s|%s\n", vec[XS_WATCH_PATH], vec[XS_WATCH_TOKEN]);
+    
+    //set status to initialised
+    snprintf(keybuf, sizeof keybuf, "device/audio/%d/state", DEVID);
+    snprintf(valbuf, sizeof valbuf, "%d", XenbusStateInitialised);
+    xs_write(xsh, 0, keybuf, valbuf, strlen(valbuf));
+
+
+    //puts(*out);
+
     //wait for backend to connect
     //xc_evtchn_pending(event_channel_port);
     //sleep(10);
@@ -323,14 +393,7 @@ int pa__init(pa_module*m) {
         goto fail;
     }*/
 
-    ss = m->core->default_sample_spec;
-    map = m->core->default_channel_map;
-    if (pa_modargs_get_sample_spec_and_channel_map(ma, &ss, &map, PA_CHANNEL_MAP_DEFAULT) < 0) {
-        pa_log("Invalid sample format specification or channel map");
-        goto fail;
-    }
-
-    u = pa_xnew0(struct userdata, 1);
+        u = pa_xnew0(struct userdata, 1);
     u->core = m->core;
     u->module = m;
     m->userdata = u;
@@ -526,38 +589,46 @@ int alloc_gref(struct ioctl_gntalloc_alloc_gref *gref, void **addr)
 
 int ring_write(struct ring *r, void *src, int length)
 {
-    int ring_free_bytes = (sizeof(r->buffer) - (r->prod_indx-r->cons_indx) -1) % sizeof(r->buffer);
-    //free space may be split over the end of the buffer
-    int first_chunk_size = (sizeof(r->buffer)-r->prod_indx);
-    int second_chunk_size = (r->cons_indx>=r->prod_indx)? (r->cons_indx) : 0;
-    int l, fl, sl;
+#define RING_FREE_BYTES ((sizeof(r->buffer) - (r->prod_indx-r->cons_indx) -1) % sizeof(r->buffer))
+    int full = 0;
+    int total_bytes = 0;
+    for(;;){
+        //free space may be split over the end of the buffer
+        int first_chunk_size = (sizeof(r->buffer)-r->prod_indx);
+        int second_chunk_size = (r->cons_indx>=r->prod_indx)? (r->cons_indx) : 0;
+        int l, fl, sl;
 
-    //full?
-    if(ring_free_bytes==0) {
-        //printf("XEN: Buffer is full: bufsize:%d prod_indx:%d consindx:%d, free:%d total:%d\n", sizeof(r->buffer), r->prod_indx, r->cons_indx,ring_free_bytes, total_bytes);
-        //xc_evtchn_notify(xce, xen_evtchn_port);
-        //usleep(10);
-        //return EAGAIN;// ring_wait_for_event(ioring);
-        errno = EINTR;
-        return -1;
+        //full?
+        if(RING_FREE_BYTES==0) {
+            //printf("XEN: Buffer is full: bufsize:%d prod_indx:%d consindx:%d, free:%d total:%d\n", sizeof(r->buffer), r->prod_indx, r->cons_indx,ring_free_bytes, total_bytes);
+            //xc_evtchn_notify(xce, xen_evtchn_port);
+            //usleep(10);
+            //return EAGAIN;// ring_wait_for_event(ioring);
+            if(full>=10){
+                errno = EINTR;
+                return -1;
+            }
+            usleep(1000);
+            full++;
+            continue;
+        }
+
+        //calculate lengths in case of a split buffer
+        l = PA_MIN(RING_FREE_BYTES, length);
+        fl = PA_MIN(l, first_chunk_size);
+        sl = PA_MIN(l-fl, second_chunk_size);
+
+        //copy to both chunks
+        //printf("XEN: Copying chunks: bufsize:%d prod_indx:%d consindx:%d, free:%d, total:%d\n", sizeof(r->buffer), r->prod_indx, r->cons_indx, ring_free_bytes, total_bytes);
+        //printf("XEN: Copying chunks: l%d fl:%d sl%d length:%d\n",l,fl,sl,length);
+        memcpy(r->buffer+r->prod_indx, src, fl);
+        if(sl)
+            memcpy(r->buffer, src+fl, sl);
+        r->prod_indx = (r->prod_indx+fl+sl) % sizeof(r->buffer);
+
+        total_bytes += sl+fl;
+        return sl+fl;
     }
-
-    //calculate lengths in case of a split buffer
-    l = PA_MIN(ring_free_bytes, length);
-    fl = PA_MIN(l, first_chunk_size);
-    sl = PA_MIN(l-fl, second_chunk_size);
-
-    //copy to both chunks
-    //printf("XEN: Copying chunks: bufsize:%d prod_indx:%d consindx:%d, free:%d, total:%d\n", sizeof(r->buffer), r->prod_indx, r->cons_indx, ring_free_bytes, total_bytes);
-    //printf("XEN: Copying chunks: l%d fl:%d sl%d length:%d\n",l,fl,sl,length);
-    memcpy(r->buffer+r->prod_indx, src, fl);
-    if(sl)
-        memcpy(r->buffer, src+fl, sl);
-    r->prod_indx = (r->prod_indx+fl+sl) % sizeof(r->buffer);
-
-    total_bytes += sl+fl;
-    usleep(1000);
-    return sl+fl;
 }
 
 int ring_wait_for_event()
@@ -593,3 +664,38 @@ int ring_wait_for_event()
         }
 }
 
+int publish_spec(pa_sample_spec *ss){
+    /* Publish spec and set state to XenbusStateInitWait*/
+    char keybuf[128], valbuf[32];
+    snprintf(keybuf, sizeof keybuf, "device/audio/%d/format", DEVID);
+    snprintf(valbuf, sizeof valbuf, pa_sample_format_to_string(ss->format));
+    xs_write(xsh, 0, keybuf, valbuf, strlen(valbuf));
+    snprintf(keybuf, sizeof keybuf, "device/audio/%d/rate", DEVID);
+    snprintf(valbuf, sizeof valbuf, "%d", ss->rate);
+    xs_write(xsh, 0, keybuf, valbuf, strlen(valbuf));
+    snprintf(keybuf, sizeof keybuf, "device/audio/%d/channels", DEVID);
+    snprintf(valbuf, sizeof valbuf, "%d", ss->channels);
+    xs_write(xsh, 0, keybuf, valbuf, strlen(valbuf));
+
+    snprintf(keybuf, sizeof keybuf, "device/audio/%d/state", DEVID);
+    snprintf(valbuf, sizeof valbuf, "%d", XenbusStateInitWait);
+    xs_write(xsh, 0, keybuf, valbuf, strlen(valbuf));
+    return 0;
+}
+
+
+int read_backend_spec(pa_sample_spec *ss){
+    char keybuf[128], valbuf[32];
+    int len; char *out;
+    int frontend_domid = atoi(xs_read(xsh, 0, "domid", &len));
+    snprintf(keybuf, sizeof(keybuf), "/local/domain/0/backend/audio/%d/%d/default-format", frontend_domid, 0);// grant_ref);
+    out = xs_read(xsh, 0, keybuf, &len);
+    ss->format = pa_parse_sample_format(out);
+    snprintf(keybuf, sizeof(keybuf), "/local/domain/0/backend/audio/%d/%d/default-rate", frontend_domid, 0);//grant_ref);
+    out = xs_read(xsh, 0, keybuf, &len);
+    ss->rate = atoi(out);
+    snprintf(keybuf, sizeof(keybuf), "/local/domain/0/backend/audio/%d/%d/default-channels", frontend_domid, 0);// grant_ref);
+    out = xs_read(xsh, 0, keybuf, &len);
+    ss->channels = atoi(out);
+    return 0;
+}

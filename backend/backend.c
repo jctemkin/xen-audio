@@ -16,6 +16,30 @@
 #define DEBUG 1
 #define BUFSIZE 2048
 
+enum xenbus_state
+{
+	XenbusStateUnknown      = 0,
+	XenbusStateInitialising = 1,
+	XenbusStateInitWait     = 2,  /* Finished early
+					 initialisation, but waiting
+					 for information from the peer
+					 or hotplug scripts. */
+	XenbusStateInitialised  = 3,  /* Initialised and waiting for a
+					 connection from the peer. */
+	XenbusStateConnected    = 4,
+	XenbusStateClosing      = 5,  /* The device is being closed
+					 due to an error or an unplug
+					 event. */
+	XenbusStateClosed       = 6,
+
+	/*
+	* Reconfiguring: The device is being reconfigured.
+	*/
+	XenbusStateReconfiguring = 7,
+
+	XenbusStateReconfigured  = 8
+};
+
 struct ring {
     uint8_t buffer[BUFSIZE];
     uint32_t cons_indx, prod_indx;
@@ -29,13 +53,21 @@ int xci,xce;
 evtchn_port_or_error_t local_port, remote_port;
 
 int frontend_domid;
+/* The Sample format to use */
+static pa_sample_spec ss = {
+    .format = PA_SAMPLE_S16LE,
+    .rate = 44100,
+    .channels = 2
+};
 
+    struct xs_handle *xsh;
 int main(int argc,  char** argv)
 {
-    struct xs_handle *xsh;
     int grant_ref;
     char keybuf[64], valbuf[32];
+    char strbuf[64];
     char *out; unsigned int len;
+    char **vec;
     int ret;
     pid_t pid;
 
@@ -51,6 +83,18 @@ int main(int argc,  char** argv)
     xce = xc_evtchn_open(NULL, 0);
     //perror("xs_evtchn_open");
 
+    /*struct xs_permissions xps; 
+    xps.id = frontend_domid;
+    xps.perms = XS_PERM_READ|XS_PERM_WRITE;
+    xs_set_permissions(xsh, NULL,
+			keybuf, &xps, 
+			1);
+    if (!xs_watch(xsh, keybuf, "mytoken"))
+        perror("xs_watch");*/
+ 
+
+
+    
     //read xenstore
     snprintf(keybuf, sizeof(keybuf), "/local/domain/%d/device/audio/0/event-channel", frontend_domid);
     out = xs_read(xsh, 0, keybuf, &len);
@@ -62,18 +106,45 @@ int main(int argc,  char** argv)
     //perror("xs_read");
     grant_ref = atoi(out);
 
+
+    /* First initialization phase
+     * Publish a set of suggested parameters to xenstore and read the frontend's parameters
+     * */
+    /***************************/
+    snprintf(keybuf, sizeof(keybuf), "/local/domain/0/backend/audio/%d/%d/default-format", frontend_domid,0);// grant_ref);
+    xs_write(xsh, 0, keybuf, pa_sample_format_to_string(ss.format), strlen(pa_sample_format_to_string(ss.format)));
+    snprintf(keybuf, sizeof(keybuf), "/local/domain/0/backend/audio/%d/%d/default-rate", frontend_domid, grant_ref);
+    snprintf(valbuf, sizeof(valbuf), "%d", ss.rate);
+    xs_write(xsh, 0, keybuf, valbuf, strlen(valbuf));
+    snprintf(keybuf, sizeof(keybuf), "/local/domain/0/backend/audio/%d/%d/default-channels", frontend_domid,0);// grant_ref);
+    snprintf(valbuf, sizeof(valbuf), "%d", ss.channels);
+    xs_write(xsh, 0, keybuf, valbuf, strlen(valbuf));
+
+    snprintf(keybuf, sizeof(keybuf), "/local/domain/0/backend/audio/%d/%d/state", frontend_domid,0);// grant_ref);
+    snprintf(valbuf, sizeof(valbuf), "%d", XenbusStateInitWait);
+    xs_write(xsh, 0, keybuf, valbuf, strlen(valbuf));
+
+
+
+    //just accept the frontend's parameters for now
+    read_frontend_spec(&ss);
+
+    char sss[100];
+    pa_sample_spec_snprint(sss, 100, &ss);
+    puts(sss);
+
+    snprintf(keybuf, sizeof(keybuf), "/local/domain/0/backend/audio/%d/%d/state", frontend_domid, 0);//grant_ref);
+    snprintf(valbuf, sizeof(valbuf), "%d", XenbusStateInitialised);
+    xs_write(xsh, 0, keybuf, valbuf, strlen(valbuf));
+    
+    /*************************/
     //bind event channel
     local_port = xc_evtchn_bind_interdomain(xce, frontend_domid, remote_port);
 
     //map guest page locally
     //map_grant(frontend_domid, grant_ref, &ioring);
 
-    /* The Sample format to use */
-    static const pa_sample_spec ss = {
-        .format = PA_SAMPLE_S16LE,
-        .rate = 44100,
-        .channels = 2
-    };
+
     pa_simple *s = NULL;
 
     char buf[65536];
@@ -116,7 +187,7 @@ int main(int argc,  char** argv)
                         if(sync) r++;
                     }
                     empty++;
-                    usleep(100);
+                    usleep(10000);
                     if(empty>10) break; 
                 }
 
@@ -222,3 +293,18 @@ int ring_wait_for_event()
     }
 }
 
+int read_frontend_spec(pa_sample_spec *ss){
+    char keybuf[128], valbuf[128];
+    char *out; int len;
+    snprintf(keybuf, sizeof keybuf, "/local/domain/%d/device/audio/%d/format", frontend_domid, 0);
+    out = xs_read(xsh, 0, keybuf, &len);
+    ss->format = pa_parse_sample_format(out);
+    snprintf(keybuf, sizeof keybuf, "/local/domain/%d/device/audio/%d/rate", frontend_domid, 0);
+    out = xs_read(xsh, 0, keybuf, &len);
+    ss->rate = atoi(out);
+    snprintf(keybuf, sizeof keybuf, "/local/domain/%d/device/audio/%d/channels", frontend_domid, 0);
+    out = xs_read(xsh, 0, keybuf, &len);
+    ss->channels = atoi(out);
+
+    return 0;
+}
