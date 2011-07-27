@@ -67,7 +67,7 @@ PA_MODULE_USAGE(
 #define DEFAULT_FILE_NAME "fifo_output"
 #define DEFAULT_SINK_NAME "fifo_output"
 
-#define DEVID 0
+int device_id = -1;
 enum xenbus_state
 {
 	XenbusStateUnknown      = 0,
@@ -131,17 +131,22 @@ static const char* const valid_modargs[] = {
     NULL
 };
 
+// Xen globals
 /*xc_evtchn_t, xc_interface */
 static int xch, xce, xen_evtchn_port;
 static struct xs_handle *xsh;
 
+struct ioctl_gntalloc_alloc_gref gref;
 int total_bytes;
 
 int alloc_gref(struct ioctl_gntalloc_alloc_gref *gref, void **addr);
 int ring_write(struct ring *r, void *src, int length);
 int ring_wait_for_event();
 int publish_spec(pa_sample_spec *ss);
-int read_backend_spec(pa_sample_spec *ss);
+int read_spec(pa_sample_spec *ss);
+int publish_param(char *paramname, char *value);
+int publish_param_int(char *paramname, int value);
+char* read_param(char *paramname);
 
 static int sink_process_msg(pa_msgobject *o, int code, void *data, int64_t offset, pa_memchunk *chunk) {
     struct userdata *u = PA_SINK(o)->userdata;
@@ -282,11 +287,10 @@ int pa__init(pa_module*m) {
     char *buf;
     char *out; int len;
     char **vec;
-    unsigned int frontend_domid, num_strings;
+    unsigned int my_domid, num_strings;
 
     total_bytes = 0;
     int ret;
-    struct ioctl_gntalloc_alloc_gref gref;
     pa_assert(m);
 
     if (!(ma = pa_modargs_new(m->argument, valid_modargs))) {
@@ -294,38 +298,29 @@ int pa__init(pa_module*m) {
         goto fail;
     }
 
-    //xen init
+    //Xen init
     xsh = xs_domain_open();
-    if(xsh==NULL){
-        pa_log("xs_domain_open failed");
-        goto fail;
-    }
+    if(xsh==NULL){ pa_log("xs_domain_open failed"); goto fail; }
+
     xch = xc_interface_open(NULL, NULL, 0);
-    if(xch==0){
-        pa_log("xc_interface_open failed");
-        goto fail;
-    }
+    if(xch==0){ pa_log("xc_interface_open failed"); goto fail; }
+
     xce = xc_evtchn_open(NULL, 0);
-    if(xce==0){
-        pa_log("xc_evtchn_open failed");
-        goto fail;
-    }
+    if(xce==0){ pa_log("xc_evtchn_open failed"); goto fail; }
+
     //use only dom0 as the backend for now
     xen_evtchn_port = xc_evtchn_bind_unbound_port(xce, 0);
-    if(xen_evtchn_port<0){
-        pa_log("xc_evtchn_bind_unbound_port failed");
-    }
+    if(xen_evtchn_port<0){ pa_log("xc_evtchn_bind_unbound_port failed"); }
 
     //get grant reference & map locally
     ret = alloc_gref(&gref, (void**)&ioring);
+    device_id = 0;//(int)gref.gref_ids[0];
+
+    my_domid = atoi(xs_read(xsh, 0, "domid", &len));
 
     //post event chan & grant reference to xenstore
-    snprintf(keybuf, sizeof keybuf, "device/audio/%d/event-channel", DEVID);
-    snprintf(valbuf, sizeof valbuf, "%d", xen_evtchn_port);
-    xs_write(xsh, 0, keybuf, valbuf, strlen(valbuf));
-    snprintf(keybuf, sizeof keybuf, "device/audio/%d/ring-ref", DEVID);
-    snprintf(valbuf, sizeof valbuf, "%d", gref.gref_ids[0]);
-    xs_write(xsh, 0, keybuf, valbuf, strlen(valbuf));
+    publish_param_int("event-channel", xen_evtchn_port);
+    publish_param_int("ring-ref", gref.gref_ids[0]);
 
     ss = m->core->default_sample_spec;
     map = m->core->default_channel_map;
@@ -333,67 +328,57 @@ int pa__init(pa_module*m) {
         pa_log("Invalid sample format specification or channel map");
         goto fail;
     }
-    frontend_domid = atoi(xs_read(xsh, 0, "domid", &len));
 
-    //First negotiation phase; post default frontend parameters and wait for backend response
-    snprintf(keybuf, sizeof(keybuf), "/local/domain/0/backend/audio/%d/%d/state", frontend_domid, 0);//gref);
-    if (!xs_watch(xsh, keybuf, "mytoken")) perror("xs_watch");
-    int current_backend_state;
+    //// Start negiotiation
+    //
+    //1. publish frontend parameters
     publish_spec(&ss);
 
+    //2. set watch on backend state
+    snprintf(keybuf, sizeof(keybuf), "/local/domain/0/backend/audio/%d/%d/state", my_domid, device_id);
+    if (!xs_watch(xsh, keybuf, "mytoken")) perror("xs_watch");
+
+    //3. read the backend state
+    //XenbusStateInitialising := backend has not responded yet
+    //XenbusStateReconfiguring := sample spec unsupported
+    //XenbusStateInitialised := sample spec OK
     int backend_state = 0;
-    //wait for backend to acknowledge reading the sample spec
+    // read initial state and discard
+    if(!(vec=xs_read_watch(xsh, &num_strings))) perror("xs_read_watch");
+
+    //4. wait for backend response
     do{
-    //read_backend_state(&state);
         if(!(vec=xs_read_watch(xsh, &num_strings))) perror("xs_read_watch");
+        
         printf("vec contents: %s|%s\n", vec[XS_WATCH_PATH], vec[XS_WATCH_TOKEN]);
+
         buf = xs_read(xsh, 0, vec[XS_WATCH_PATH], &len);
         backend_state = atoi(buf);
-    } while(backend_state!=XenbusStateInitialised && backend_state!=XenbusStateReconfiguring);
+    } while(backend_state!=XenbusStateInitialised && \
+            backend_state!=XenbusStateReconfiguring);
     
+    //5. Two outcomes:
+
+    //backend rejected sample spec?
     if(backend_state!=XenbusStateInitialised){
-        //backend rejected sample spec
-
         //simple fallback; accept backend's parameters
-        read_backend_spec(&ss);
+        read_spec(&ss);
     }
+    /*else: sample spec was accepted, go on*/
 
+    publish_param_int("state", XenbusStateInitialised);
+    //
+    ////End of negotiation
+    
+    /*
     if(!(vec=xs_read_watch(xsh, &num_strings))) perror("xs_read_watch");
     printf("vec contents: %s|%s\n", vec[XS_WATCH_PATH], vec[XS_WATCH_TOKEN]);
+    */
     
     //set status to initialised
-    snprintf(keybuf, sizeof keybuf, "device/audio/%d/state", DEVID);
-    snprintf(valbuf, sizeof valbuf, "%d", XenbusStateInitialised);
-    xs_write(xsh, 0, keybuf, valbuf, strlen(valbuf));
 
 
-    //puts(*out);
-
-    //wait for backend to connect
-    //xc_evtchn_pending(event_channel_port);
-    //sleep(10);
-    //send notification
-    //xc_evtchn_notify(xce, xen_evtchn_port);
-
-    //puts(ioring->buffer);
-    //goto fail; ///////////////testing
-
-    /*
-    snprintf(keybuf, sizeof keybuf, "device/audio/%d/ring-ref", DEVID);
-    snprintf(valbuf, sizeof valbuf, "%d", grantref);
-    xs_write(xsh, 0, keybuf, valbuf, strlen(valbuf));
-    */
-    //get sample spec from xen store
-
-    /*
-    snprintf(keybuf, sizeof keybuf, "/local/domain/0/backend/audio/%d/default-channels", DEVID);
-    out = xs_read(xsh, 0, keybuf, &len);
-    if (out==NULL){
-        pa_log("Failed to read sample spec from xenstore");
-        goto fail;
-    }*/
-
-        u = pa_xnew0(struct userdata, 1);
+    u = pa_xnew0(struct userdata, 1);
     u->core = m->core;
     u->module = m;
     m->userdata = u;
@@ -402,35 +387,15 @@ int pa__init(pa_module*m) {
     pa_thread_mq_init(&u->thread_mq, m->core->mainloop, u->rtpoll);
     u->write_type = 0;
 
-    //u->filename = pa_runtime_path(pa_modargs_get_value(ma, "file", DEFAULT_FILE_NAME));
-
-    //todo xen : init ring buffer
+    //init ring buffer
     ioring->prod_indx = ioring->cons_indx = 0;
-    /*mkfifo(u->filename, 0666);
-    if ((u->fd = open(u->filename, O_RDWR|O_NOCTTY)) < 0) {
-        pa_log("open('%s'): %s", u->filename, pa_cstrerror(errno));
-        goto fail;
-    }
 
-    pa_make_fd_cloexec(u->fd);
-    pa_make_fd_nonblock(u->fd);
-
-    if (fstat(u->fd, &st) < 0) {
-        pa_log("fstat('%s'): %s", u->filename, pa_cstrerror(errno));
-        goto fail;
-    }
-
-    if (!S_ISFIFO(st.st_mode)) {
-        pa_log("'%s' is not a FIFO.", u->filename);
-        goto fail;
-    }
-*/
     pa_sink_new_data_init(&data);
     data.driver = __FILE__;
     data.module = m;
     pa_sink_new_data_set_name(&data, pa_modargs_get_value(ma, "sink_name", DEFAULT_SINK_NAME));
     pa_proplist_sets(data.proplist, PA_PROP_DEVICE_STRING, "xensink");//u->filename);
-    pa_proplist_setf(data.proplist, PA_PROP_DEVICE_DESCRIPTION, "Unix FIFO sink %s", u->filename);
+    pa_proplist_setf(data.proplist, PA_PROP_DEVICE_DESCRIPTION, "Xen PV audio sink", u->filename);
     pa_sink_new_data_set_sample_spec(&data, &ss);
     pa_sink_new_data_set_channel_map(&data, &map);
 
@@ -531,9 +496,11 @@ void pa__done(pa_module*m) {
 
     pa_xfree(u);
 
-    snprintf(keybuf, sizeof(keybuf), "device/audio/%d", DEVID);
+    snprintf(keybuf, sizeof(keybuf), "device/audio/%d", device_id);
     //delete xenstore keys
     xs_rm(xsh, 0, keybuf);
+
+    //munmap((void*)gref.index, 4096);
 
     //close xen interfaces
     xc_evtchn_close(xce);
@@ -544,47 +511,47 @@ void pa__done(pa_module*m) {
 
 int alloc_gref(struct ioctl_gntalloc_alloc_gref *gref, void **addr)
 {
-        int alloc_fd, dev_fd, rv;
-       	alloc_fd = open("/dev/xen/gntalloc", O_RDWR);
-	dev_fd = open("/dev/xen/gntdev", O_RDWR);
+    int alloc_fd, dev_fd, rv;
+    alloc_fd = open("/dev/xen/gntalloc", O_RDWR);
+    dev_fd = open("/dev/xen/gntdev", O_RDWR);
 
-        /*use dom0*/
-        gref->domid = 0;
-        gref->flags = GNTALLOC_FLAG_WRITABLE;
-        gref->count = 1;
+    /*use dom0*/
+    gref->domid = 0;
+    gref->flags = GNTALLOC_FLAG_WRITABLE;
+    gref->count = 1;
 
-        rv = ioctl(alloc_fd, IOCTL_GNTALLOC_ALLOC_GREF, gref);
-	if (rv) {
-		printf("src-add error: %s (rv=%d)\n", strerror(errno), rv);
-		return rv;
-	}
-
-                        /*addr=NULL(default),length, prot,             flags,    fd,   offset*/
-	*addr = mmap(0, 4096, PROT_READ|PROT_WRITE, MAP_SHARED, alloc_fd, gref->index);
-	if (*addr == MAP_FAILED) {
-		*addr = 0;
-		printf("mmap failed: SHOULD NOT HAPPEN\n");
-		return rv;
-	}
-
-	printf("Got grant #%d. Mapped locally at %Ld=%p\n",
-		gref->gref_ids[0], gref->index, *addr);
-
-        /* skip this for now
-	struct ioctl_gntalloc_unmap_notify uarg = {
-		.index = gref->index + offsetof(struct shr_page, notifies[0]),
-		.action = UNMAP_NOTIFY_CLEAR_BYTE
-	};
-
-	rv = ioctl(a_fd, IOCTL_GNTALLOC_SET_UNMAP_NOTIFY, &uarg);
-	if (rv)
-		printf("gntalloc unmap notify error: %s (rv=%d)\n", strerror(errno), rv);
-        */
-
-        close(alloc_fd);
-        close(dev_fd);
-
+    rv = ioctl(alloc_fd, IOCTL_GNTALLOC_ALLOC_GREF, gref);
+    if (rv) {
+        printf("src-add error: %s (rv=%d)\n", strerror(errno), rv);
         return rv;
+    }
+
+    /*addr=NULL(default),length, prot,             flags,    fd,   offset*/
+    *addr = mmap(0, 4096, PROT_READ|PROT_WRITE, MAP_SHARED, alloc_fd, gref->index);
+    if (*addr == MAP_FAILED) {
+        *addr = 0;
+        printf("mmap failed: SHOULD NOT HAPPEN\n");
+        return rv;
+    }
+
+    printf("Got grant #%d. Mapped locally at %Ld=%p\n",
+            gref->gref_ids[0], gref->index, *addr);
+
+    /* skip this for now
+       struct ioctl_gntalloc_unmap_notify uarg = {
+       .index = gref->index + offsetof(struct shr_page, notifies[0]),
+       .action = UNMAP_NOTIFY_CLEAR_BYTE
+       };
+
+       rv = ioctl(a_fd, IOCTL_GNTALLOC_SET_UNMAP_NOTIFY, &uarg);
+       if (rv)
+       printf("gntalloc unmap notify error: %s (rv=%d)\n", strerror(errno), rv);
+       */
+
+    close(alloc_fd);
+    close(dev_fd);
+
+    return rv;
 }
 
 int ring_write(struct ring *r, void *src, int length)
@@ -601,14 +568,13 @@ int ring_write(struct ring *r, void *src, int length)
         //full?
         if(RING_FREE_BYTES==0) {
             //printf("XEN: Buffer is full: bufsize:%d prod_indx:%d consindx:%d, free:%d total:%d\n", sizeof(r->buffer), r->prod_indx, r->cons_indx,ring_free_bytes, total_bytes);
-            //xc_evtchn_notify(xce, xen_evtchn_port);
-            //usleep(10);
-            //return EAGAIN;// ring_wait_for_event(ioring);
-            if(full>=10){
+            //TODO This should be replaced by something that checks whether the backend is alive
+            if(full>=100){
                 errno = EINTR;
                 return -1;
             }
             usleep(1000);
+            //should return in 100ms max; definitely not midstream
             full++;
             continue;
         }
@@ -633,8 +599,8 @@ int ring_write(struct ring *r, void *src, int length)
 
 int ring_wait_for_event()
 {
-        puts("XEN:Blocking");
-        fflush(stdout);
+    //puts("XEN:Blocking");
+    //fflush(stdout);
 	fd_set readfds;
 	int xcefd, ret;
 	struct timeval timeout;
@@ -658,44 +624,71 @@ int ring_wait_for_event()
 	else if(ret && FD_ISSET(xcefd, &readfds)){
             return EAGAIN; //OK
         }
+
 	else{
             perror("select() timed out while waiting for backend\n");
             return 0;
         }
 }
 
-int publish_spec(pa_sample_spec *ss){
-    /* Publish spec and set state to XenbusStateInitWait*/
+int publish_param(char *paramname, char *value)
+{
     char keybuf[128], valbuf[32];
-    snprintf(keybuf, sizeof keybuf, "device/audio/%d/format", DEVID);
-    snprintf(valbuf, sizeof valbuf, pa_sample_format_to_string(ss->format));
-    xs_write(xsh, 0, keybuf, valbuf, strlen(valbuf));
-    snprintf(keybuf, sizeof keybuf, "device/audio/%d/rate", DEVID);
-    snprintf(valbuf, sizeof valbuf, "%d", ss->rate);
-    xs_write(xsh, 0, keybuf, valbuf, strlen(valbuf));
-    snprintf(keybuf, sizeof keybuf, "device/audio/%d/channels", DEVID);
-    snprintf(valbuf, sizeof valbuf, "%d", ss->channels);
-    xs_write(xsh, 0, keybuf, valbuf, strlen(valbuf));
 
-    snprintf(keybuf, sizeof keybuf, "device/audio/%d/state", DEVID);
-    snprintf(valbuf, sizeof valbuf, "%d", XenbusStateInitWait);
-    xs_write(xsh, 0, keybuf, valbuf, strlen(valbuf));
-    return 0;
+    snprintf(keybuf, sizeof keybuf, "device/audio/%d/%s", device_id, paramname);
+    snprintf(valbuf, sizeof valbuf, "%s", value);
+    return xs_write(xsh, 0, keybuf, valbuf, strlen(valbuf));
+}
+
+int publish_param_int(char *paramname, int value)
+{
+    char keybuf[128], valbuf[32];
+    snprintf(keybuf, sizeof keybuf, "device/audio/%d/%s", device_id, paramname);
+    snprintf(valbuf, sizeof valbuf, "%d", value);
+    return xs_write(xsh, 0, keybuf, valbuf, strlen(valbuf));
+}
+
+char* read_param(char *paramname)
+{
+    char keybuf[128], valbuf[32];
+    int len;
+    int my_domid;
+
+    my_domid = atoi(xs_read(xsh, 0, "domid", &len));
+    snprintf(keybuf, sizeof(keybuf), "/local/domain/0/backend/audio/%d/%d/%s", my_domid, device_id, paramname);
+    //remember to free lvalue!
+    return xs_read(xsh, 0, keybuf, &len);
 }
 
 
-int read_backend_spec(pa_sample_spec *ss){
-    char keybuf[128], valbuf[32];
-    int len; char *out;
-    int frontend_domid = atoi(xs_read(xsh, 0, "domid", &len));
-    snprintf(keybuf, sizeof(keybuf), "/local/domain/0/backend/audio/%d/%d/default-format", frontend_domid, 0);// grant_ref);
-    out = xs_read(xsh, 0, keybuf, &len);
+int publish_spec(pa_sample_spec *ss){
+    /* Publish spec and set state to XenbusStateInitWait*/
+    int ret;
+
+    ret = publish_param("format", pa_sample_format_to_string(ss->format));
+    ret += publish_param_int("rate", ss->rate);
+    ret += publish_param_int("channels", ss->channels);
+
+    ret += publish_param_int("state", XenbusStateInitWait);
+    return ret;
+}
+
+
+int read_spec(pa_sample_spec *ss){
+    /*Read spec from backend*/
+    char *out;
+
+    out = read_param("default-format"); 
     ss->format = pa_parse_sample_format(out);
-    snprintf(keybuf, sizeof(keybuf), "/local/domain/0/backend/audio/%d/%d/default-rate", frontend_domid, 0);//grant_ref);
-    out = xs_read(xsh, 0, keybuf, &len);
+    free(out);
+
+    out = read_param("default-rate"); 
     ss->rate = atoi(out);
-    snprintf(keybuf, sizeof(keybuf), "/local/domain/0/backend/audio/%d/%d/default-channels", frontend_domid, 0);// grant_ref);
-    out = xs_read(xsh, 0, keybuf, &len);
+    free(out);
+
+    out = read_param("default-channels"); 
     ss->channels = atoi(out);
+    free(out);
+
     return 0;
 }

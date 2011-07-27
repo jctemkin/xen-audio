@@ -48,11 +48,15 @@ struct ring {
 
 int map_grant(int frontend_id, int grant_ref, struct ring **addr);
 int ring_wait_for_event();
+int publish_param(char *paramname, char *value);
+int publish_param_int(char *paramname, int value);
+char* read_param(char *paramname);
 
 int xci,xce;
 evtchn_port_or_error_t local_port, remote_port;
 
 int frontend_domid;
+int device_id;
 /* The Sample format to use */
 static pa_sample_spec ss = {
     .format = PA_SAMPLE_S16LE,
@@ -96,35 +100,23 @@ int main(int argc,  char** argv)
 
     
     //read xenstore
-    snprintf(keybuf, sizeof(keybuf), "/local/domain/%d/device/audio/0/event-channel", frontend_domid);
-    out = xs_read(xsh, 0, keybuf, &len);
-    //perror("xs_read");
+    out = read_param("event-channel");
     remote_port = atoi(out);
+    free(out);
 
-    snprintf(keybuf, sizeof(keybuf), "/local/domain/%d/device/audio/0/ring-ref", frontend_domid);
-    out = xs_read(xsh, 0, keybuf, &len);
-    //perror("xs_read");
+    out = read_param("ring-ref");
     grant_ref = atoi(out);
+    free(out);
 
+    device_id = 0; //grant_ref;
 
-    /* First initialization phase
-     * Publish a set of suggested parameters to xenstore and read the frontend's parameters
-     * */
-    /***************************/
-    snprintf(keybuf, sizeof(keybuf), "/local/domain/0/backend/audio/%d/%d/default-format", frontend_domid,0);// grant_ref);
-    xs_write(xsh, 0, keybuf, pa_sample_format_to_string(ss.format), strlen(pa_sample_format_to_string(ss.format)));
-    snprintf(keybuf, sizeof(keybuf), "/local/domain/0/backend/audio/%d/%d/default-rate", frontend_domid, grant_ref);
-    snprintf(valbuf, sizeof(valbuf), "%d", ss.rate);
-    xs_write(xsh, 0, keybuf, valbuf, strlen(valbuf));
-    snprintf(keybuf, sizeof(keybuf), "/local/domain/0/backend/audio/%d/%d/default-channels", frontend_domid,0);// grant_ref);
-    snprintf(valbuf, sizeof(valbuf), "%d", ss.channels);
-    xs_write(xsh, 0, keybuf, valbuf, strlen(valbuf));
+    /*Begin negotiation **********************/
+    //Publish maximum capabilities
+    publish_param("default-format", pa_sample_format_to_string(ss.format));
+    publish_param_int("default-rate", ss.rate);
+    publish_param_int("default-channels", ss.channels);
 
-    snprintf(keybuf, sizeof(keybuf), "/local/domain/0/backend/audio/%d/%d/state", frontend_domid,0);// grant_ref);
-    snprintf(valbuf, sizeof(valbuf), "%d", XenbusStateInitWait);
-    xs_write(xsh, 0, keybuf, valbuf, strlen(valbuf));
-
-
+    publish_param_int("state", XenbusStateInitWait);
 
     //just accept the frontend's parameters for now
     read_frontend_spec(&ss);
@@ -133,11 +125,9 @@ int main(int argc,  char** argv)
     pa_sample_spec_snprint(sss, 100, &ss);
     puts(sss);
 
-    snprintf(keybuf, sizeof(keybuf), "/local/domain/0/backend/audio/%d/%d/state", frontend_domid, 0);//grant_ref);
-    snprintf(valbuf, sizeof(valbuf), "%d", XenbusStateInitialised);
-    xs_write(xsh, 0, keybuf, valbuf, strlen(valbuf));
-    
-    /*************************/
+    publish_param_int("state", XenbusStateInitialised);
+    /*End negotiation ***********************/
+
     //bind event channel
     local_port = xc_evtchn_bind_interdomain(xce, frontend_domid, remote_port);
 
@@ -293,18 +283,61 @@ int ring_wait_for_event()
     }
 }
 
+char* read_param(char *paramname)
+{
+    char keybuf[128], valbuf[32];
+    char *out;
+    int len;
+
+    snprintf(keybuf, sizeof(keybuf), "/local/domain/%d/device/audio/%d/%s", frontend_domid, device_id, paramname);
+    //remember to free lvalue!
+    out = xs_read(xsh, 0, keybuf, &len);
+    return out;
+}
+
 int read_frontend_spec(pa_sample_spec *ss){
-    char keybuf[128], valbuf[128];
-    char *out; int len;
-    snprintf(keybuf, sizeof keybuf, "/local/domain/%d/device/audio/%d/format", frontend_domid, 0);
-    out = xs_read(xsh, 0, keybuf, &len);
+    char *out;
+
+    out = read_param("format");
     ss->format = pa_parse_sample_format(out);
-    snprintf(keybuf, sizeof keybuf, "/local/domain/%d/device/audio/%d/rate", frontend_domid, 0);
-    out = xs_read(xsh, 0, keybuf, &len);
+    free(out);
+
+    out = read_param("rate");
     ss->rate = atoi(out);
-    snprintf(keybuf, sizeof keybuf, "/local/domain/%d/device/audio/%d/channels", frontend_domid, 0);
-    out = xs_read(xsh, 0, keybuf, &len);
+    free(out);
+
+    out = read_param("channels");
     ss->channels = atoi(out);
+    free(out);
 
     return 0;
 }
+
+int publish_param(char *paramname, char *value)
+{
+    char keybuf[128], valbuf[32];
+    snprintf(keybuf, sizeof keybuf, "/local/domain/0/backend/audio/%d/%d/%s", frontend_domid, device_id, paramname);
+    snprintf(valbuf, sizeof valbuf, "%s", value);
+    return xs_write(xsh, 0, keybuf, valbuf, strlen(valbuf));
+}
+
+int publish_param_int(char *paramname, int value)
+{
+    char keybuf[128], valbuf[32];
+    snprintf(keybuf, sizeof keybuf, "/local/domain/0/backend/audio/%d/%d/%s", frontend_domid, device_id, paramname);
+    snprintf(valbuf, sizeof valbuf, "%d", value);
+    return xs_write(xsh, 0, keybuf, valbuf, strlen(valbuf));
+}
+
+int publish_spec(pa_sample_spec *ss){
+    /* Publish spec and set state to XenbusStateInitWait*/
+    int ret;
+
+    ret = publish_param("format", pa_sample_format_to_string(ss->format));
+    ret += publish_param_int("rate", ss->rate);
+    ret += publish_param_int("channels", ss->channels);
+
+    ret += publish_param_int("state", XenbusStateInitWait);
+    return ret;
+}
+
