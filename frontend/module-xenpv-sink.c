@@ -367,6 +367,9 @@ int pa__init(pa_module*m) {
     /*else: sample spec was accepted, go on*/
 
     publish_param_int("state", XenbusStateInitialised);
+    char sss[100];
+    pa_sample_spec_snprint(sss, 100, &ss);
+    puts(sss);
     //
     ////End of negotiation
     

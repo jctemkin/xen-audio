@@ -60,7 +60,7 @@ int device_id;
 /* The Sample format to use */
 static pa_sample_spec ss = {
     .format = PA_SAMPLE_S16LE,
-    .rate = 44100,
+    .rate = PA_RATE_MAX,//44100,
     .channels = 2
 };
 
@@ -118,14 +118,16 @@ int main(int argc,  char** argv)
 
     publish_param_int("state", XenbusStateInitWait);
 
-    //just accept the frontend's parameters for now
-    read_frontend_spec(&ss);
+    //just --accept-- reject the frontend's parameters for now
+    //read_frontend_spec(&ss);
 
     char sss[100];
     pa_sample_spec_snprint(sss, 100, &ss);
     puts(sss);
 
-    publish_param_int("state", XenbusStateInitialised);
+    //publish_param_int("state", XenbusStateInitialised);
+    publish_param_int("state", XenbusStateReconfiguring);
+
     /*End negotiation ***********************/
 
     //bind event channel
@@ -177,7 +179,7 @@ int main(int argc,  char** argv)
                         if(sync) r++;
                     }
                     empty++;
-                    usleep(10000);
+                    usleep(pa_bytes_to_usec(BUFSIZE>>2, &ss));
                     if(empty>10) break; 
                 }
 
