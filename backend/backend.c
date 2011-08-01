@@ -5,6 +5,7 @@
 #include <string.h>
 #include <stdlib.h>
 #include <fcntl.h>
+#include <unistd.h>
 
 #include <pulse/simple.h>
 #include <pulse/error.h>
@@ -18,26 +19,26 @@
 
 enum xenbus_state
 {
-	XenbusStateUnknown      = 0,
-	XenbusStateInitialising = 1,
-	XenbusStateInitWait     = 2,  /* Finished early
-					 initialisation, but waiting
-					 for information from the peer
-					 or hotplug scripts. */
-	XenbusStateInitialised  = 3,  /* Initialised and waiting for a
-					 connection from the peer. */
-	XenbusStateConnected    = 4,
-	XenbusStateClosing      = 5,  /* The device is being closed
-					 due to an error or an unplug
-					 event. */
-	XenbusStateClosed       = 6,
+    XenbusStateUnknown      = 0,
+    XenbusStateInitialising = 1,
+    XenbusStateInitWait     = 2,  /* Finished early
+                                     initialisation, but waiting
+                                     for information from the peer
+                                     or hotplug scripts. */
+    XenbusStateInitialised  = 3,  /* Initialised and waiting for a
+                                     connection from the peer. */
+    XenbusStateConnected    = 4,
+    XenbusStateClosing      = 5,  /* The device is being closed
+                                     due to an error or an unplug
+                                     event. */
+    XenbusStateClosed       = 6,
 
-	/*
-	* Reconfiguring: The device is being reconfigured.
-	*/
-	XenbusStateReconfiguring = 7,
+    /*
+     * Reconfiguring: The device is being reconfigured.
+     */
+    XenbusStateReconfiguring = 7,
 
-	XenbusStateReconfigured  = 8
+    XenbusStateReconfigured  = 8
 };
 
 struct ring {
@@ -48,33 +49,30 @@ struct ring {
 
 int map_grant(int frontend_id, int grant_ref, struct ring **addr);
 int ring_wait_for_event();
-int publish_param(char *paramname, char *value);
-int publish_param_int(char *paramname, int value);
-char* read_param(char *paramname);
+int publish_param(const char *paramname, const char *value);
+int publish_param_int(const char *paramname, int value);
+char* read_param(const char *paramname);
+int read_frontend_spec(pa_sample_spec *ss);
 
-int xci,xce;
-evtchn_port_or_error_t local_port, remote_port;
+xc_interface* xci;
+xc_evtchn* xce;
+evtchn_port_t local_port, remote_port;
 
 int frontend_domid;
 int device_id;
 /* The Sample format to use */
 static pa_sample_spec ss = {
     .format = PA_SAMPLE_S16LE,
-    .rate = PA_RATE_MAX,//44100,
+    .rate = 44100,
     .channels = 2
 };
 
-    struct xs_handle *xsh;
+struct xs_handle *xsh;
 int main(int argc,  char** argv)
 {
     int grant_ref;
-    char keybuf[64], valbuf[32];
-    char strbuf[64];
-    char *out; unsigned int len;
-    char **vec;
-    int ret;
-    pid_t pid;
-
+    char *out;
+    pa_sample_spec frontss;
     int error;
 
     frontend_domid = atoi(argv[1]);
@@ -88,17 +86,17 @@ int main(int argc,  char** argv)
     //perror("xs_evtchn_open");
 
     /*struct xs_permissions xps; 
-    xps.id = frontend_domid;
-    xps.perms = XS_PERM_READ|XS_PERM_WRITE;
-    xs_set_permissions(xsh, NULL,
-			keybuf, &xps, 
-			1);
-    if (!xs_watch(xsh, keybuf, "mytoken"))
-        perror("xs_watch");*/
- 
+      xps.id = frontend_domid;
+      xps.perms = XS_PERM_READ|XS_PERM_WRITE;
+      xs_set_permissions(xsh, NULL,
+      keybuf, &xps, 
+      1);
+      if (!xs_watch(xsh, keybuf, "mytoken"))
+      perror("xs_watch");*/
 
 
-    
+
+
     //read xenstore
     out = read_param("event-channel");
     remote_port = atoi(out);
@@ -118,15 +116,19 @@ int main(int argc,  char** argv)
 
     publish_param_int("state", XenbusStateInitWait);
 
-    //just --accept-- reject the frontend's parameters for now
-    //read_frontend_spec(&ss);
+    read_frontend_spec(&frontss);
+
+    if(pa_sample_spec_valid(&frontss) && pa_frame_size(&frontss)<=pa_frame_size(&ss) && frontss.rate<=ss.rate)
+    {/* accept frontend params */
+        read_frontend_spec(&ss);
+        publish_param_int("state", XenbusStateInitialised);
+    }
+    else /* reject; frontend is forced to use the default spec  */
+        publish_param_int("state", XenbusStateReconfiguring);
 
     char sss[100];
     pa_sample_spec_snprint(sss, 100, &ss);
     puts(sss);
-
-    //publish_param_int("state", XenbusStateInitialised);
-    publish_param_int("state", XenbusStateReconfiguring);
 
     /*End negotiation ***********************/
 
@@ -141,61 +143,65 @@ int main(int argc,  char** argv)
 
     char buf[65536];
     ssize_t r = 0;
-    while(1){
-        if((pid=fork())<0){
-            perror("Fork failed:");
-            return -1;
-        }
-        else { //success
-            if(pid!=0){ //parent
-                /* wait for event, fork again when it happens*/
-                wait(pid);
-                ring_wait_for_event();
+    /* drain buffer */
+    if(!(s=pa_simple_new(NULL, "xen-backend", PA_STREAM_PLAYBACK, NULL, "playback", &ss, NULL, NULL, &error))) 
+        puts(pa_strerror(error));
+    //printf("%d bytes in the buffer", ioring->cons_indx-ioring->prod_indx);
+    map_grant(frontend_domid, grant_ref, &ioring);
+
+    for(;;){
+        /* Upper level loop: for each event received */
+        int empty = 0;
+        int sync=0; //skip until non-zero(ensures frame alignment)
+        for(;;){
+            /* skip index until not null */
+            while(ioring->cons_indx != ioring->prod_indx && !sync){
+                if(*(ioring->buffer+ioring->cons_indx))
+                    sync=1;
+                else 
+                    ioring->cons_indx = (ioring->cons_indx+1)%sizeof(ioring->buffer);
             }
-            else{ //child
-                /* drain buffer, then quit */
-                if(!(s=pa_simple_new(NULL, "xen-backend", PA_STREAM_PLAYBACK, NULL, "playback", &ss, NULL, NULL, &error))) 
-                    puts(pa_strerror(error));
-                //printf("%d bytes in the buffer", ioring->cons_indx-ioring->prod_indx);
-                map_grant(frontend_domid, grant_ref, &ioring);
 
-                int empty = 0;
-                int sync=0; //skip until non-zero(ensures frame alignment)
-                for(;;){
-                    while(ioring->cons_indx != ioring->prod_indx){
-                        empty = 0;
-                        buf[r]=*(ioring->buffer+ioring->cons_indx);
-                        //putchar(*(ioring->buffer+ioring->cons_indx));
-                        //write(dspfd, ioring->buffer+ioring->cons_indx, 1);
-                        //wrap
-                        ioring->cons_indx = (ioring->cons_indx+1)%sizeof(ioring->buffer);
+            /* skip playback loop */
+            if(!sync) goto empty;
+            
+            /* Mid level loop: until stream is drained */
+            while(ioring->cons_indx != ioring->prod_indx){
+                empty = 0;
+                //buf[r]=*(ioring->buffer+ioring->cons_indx);
+                int rl = ioring->prod_indx>ioring->cons_indx? (ioring->prod_indx-ioring->cons_indx) : (BUFSIZE-ioring->cons_indx);
+                memcpy(buf+r, (ioring->buffer+ioring->cons_indx), rl);
+                //putchar(*(ioring->buffer+ioring->cons_indx));
+                //write(dspfd, ioring->buffer+ioring->cons_indx, 1);
+                //wrap
+                ioring->cons_indx = (ioring->cons_indx+rl)%sizeof(ioring->buffer);
 
-                        if(r==128*pa_frame_size(&ss)){
-                            if((pa_simple_write(s, buf, (size_t) r, &error))<0) puts(pa_strerror(error));
-                            r=0;
-                            //usleep(pa_bytes_to_usec(32*pa_frame_size(&ss),&ss)>>2); //TODO: calculate
-                        }
-                        if(buf[r]) sync=1;
-                        if(sync) r++;
-                    }
-                    empty++;
-                    usleep(pa_bytes_to_usec(BUFSIZE>>2, &ss));
-                    if(empty>10) break; 
-                }
-
-                if(r) {
+                r+=rl;
+                if(r>=BUFSIZE){
                     if((pa_simple_write(s, buf, (size_t) r, &error))<0) puts(pa_strerror(error));
                     r=0;
                 }
-                if((pa_simple_drain(s, &error))<0) puts(pa_strerror(error));
-                pa_simple_flush(s, &error);
-                ioring->cons_indx = ioring->prod_indx = 0;
-                munmap(ioring, 4096);
-                pa_simple_free(s);
-                exit(0);
             }
+empty:
+            empty++;
+            usleep(pa_bytes_to_usec(BUFSIZE>>2, &ss));
+            if(empty>100) break;
         }
+        if(r) {
+            /* write remaining bytes to stream */
+            if((pa_simple_write(s, buf, (size_t) r, &error))<0) puts(pa_strerror(error));
+            r=0;
+        }
+        if((pa_simple_drain(s, &error))<0) puts(pa_strerror(error));
+        pa_simple_flush(s, &error);
+        ioring->cons_indx = ioring->prod_indx = 0;
+
+        /* block until next event */
+        ring_wait_for_event();
     }
+
+    munmap(ioring, 4096);
+    pa_simple_free(s);
 
     //cleanup
     xc_evtchn_close(xce);
@@ -226,14 +232,14 @@ int map_grant(int frontend_id, int grant_ref, struct ring **addr) {
     rv = ioctl(dev_fd, IOCTL_GNTDEV_MAP_GRANT_REF, &arg);
     if (rv) {
         printf("Could not map grant %d.%d: %s (rv=%d)\n", frontend_id, grant_ref, strerror(errno), rv);
-        return;
+        return 1;
     }
 
     *addr = mmap(0, 4096, PROT_READ|PROT_WRITE, MAP_SHARED, dev_fd, arg.index);
     if (*addr == MAP_FAILED) {
         *addr = 0;
         printf("Could not map grant %d.%d: %s (map failed) (rv=%d)\n", frontend_id, grant_ref, strerror(errno), rv);
-        return;
+        return 1;
     }
 
     //printf("Mapped grant %d.%d as %Ld=%p\n", frontend_id, grant_ref, arg.index, *addr);
@@ -248,6 +254,7 @@ int map_grant(int frontend_id, int grant_ref, struct ring **addr) {
        printf("gntdev unmap notify error: %s (rv=%d)\n", strerror(errno), rv);
        */
     close(dev_fd);
+    return 0;
 }
 
 
@@ -273,23 +280,23 @@ int ring_wait_for_event()
     return 0;
 
     if(ret==-1) {
-        perror("select() returned error while waiting for backend");
+        perror("select() returned error while waiting for frontend");
         return ret;
     }
     else if(ret && FD_ISSET(xcefd, &readfds)){
         return 0; //OK
     }
     else{
-        perror("select() timed out while waiting for backend");
+        perror("select() timed out while waiting for frontend");
         return -1;
     }
 }
 
-char* read_param(char *paramname)
+char* read_param(const char *paramname)
 {
-    char keybuf[128], valbuf[32];
+    char keybuf[128];
     char *out;
-    int len;
+    unsigned int len;
 
     snprintf(keybuf, sizeof(keybuf), "/local/domain/%d/device/audio/%d/%s", frontend_domid, device_id, paramname);
     //remember to free lvalue!
@@ -315,7 +322,7 @@ int read_frontend_spec(pa_sample_spec *ss){
     return 0;
 }
 
-int publish_param(char *paramname, char *value)
+int publish_param(const char *paramname, const char *value)
 {
     char keybuf[128], valbuf[32];
     snprintf(keybuf, sizeof keybuf, "/local/domain/0/backend/audio/%d/%d/%s", frontend_domid, device_id, paramname);
@@ -323,7 +330,7 @@ int publish_param(char *paramname, char *value)
     return xs_write(xsh, 0, keybuf, valbuf, strlen(valbuf));
 }
 
-int publish_param_int(char *paramname, int value)
+int publish_param_int(const char *paramname, int value)
 {
     char keybuf[128], valbuf[32];
     snprintf(keybuf, sizeof keybuf, "/local/domain/0/backend/audio/%d/%d/%s", frontend_domid, device_id, paramname);

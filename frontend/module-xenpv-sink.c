@@ -133,7 +133,9 @@ static const char* const valid_modargs[] = {
 
 // Xen globals
 /*xc_evtchn_t, xc_interface */
-static int xch, xce, xen_evtchn_port;
+xc_interface* xch;
+xc_evtchn* xce;
+evtchn_port_t xen_evtchn_port;
 static struct xs_handle *xsh;
 
 struct ioctl_gntalloc_alloc_gref gref;
@@ -144,8 +146,8 @@ int ring_write(struct ring *r, void *src, int length);
 int ring_wait_for_event();
 int publish_spec(pa_sample_spec *ss);
 int read_spec(pa_sample_spec *ss);
-int publish_param(char *paramname, char *value);
-int publish_param_int(char *paramname, int value);
+int publish_param(const char *paramname, const char *value);
+int publish_param_int(const char *paramname, const int value);
 char* read_param(char *paramname);
 
 static int sink_process_msg(pa_msgobject *o, int code, void *data, int64_t offset, pa_memchunk *chunk) {
@@ -277,20 +279,18 @@ finish:
 
 int pa__init(pa_module*m) {
     struct userdata *u;
-    struct stat st;
     pa_sample_spec ss;
     pa_channel_map map;
     pa_modargs *ma;
-    struct pollfd *pollfd;
+    //struct pollfd *pollfd;
     pa_sink_new_data data;
-    char keybuf[128], valbuf[32];
+    char keybuf[128];
     char *buf;
-    char *out; int len;
+    unsigned int len;
     char **vec;
     unsigned int my_domid, num_strings;
 
     total_bytes = 0;
-    int ret;
     pa_assert(m);
 
     if (!(ma = pa_modargs_new(m->argument, valid_modargs))) {
@@ -313,7 +313,7 @@ int pa__init(pa_module*m) {
     if(xen_evtchn_port<0){ pa_log("xc_evtchn_bind_unbound_port failed"); }
 
     //get grant reference & map locally
-    ret = alloc_gref(&gref, (void**)&ioring);
+    if(alloc_gref(&gref, (void**)&ioring)){ pa_log("alloc_gref failed");};
     device_id = 0;//(int)gref.gref_ids[0];
 
     my_domid = atoi(xs_read(xsh, 0, "domid", &len));
@@ -398,7 +398,7 @@ int pa__init(pa_module*m) {
     data.module = m;
     pa_sink_new_data_set_name(&data, pa_modargs_get_value(ma, "sink_name", DEFAULT_SINK_NAME));
     pa_proplist_sets(data.proplist, PA_PROP_DEVICE_STRING, "xensink");//u->filename);
-    pa_proplist_setf(data.proplist, PA_PROP_DEVICE_DESCRIPTION, "Xen PV audio sink", u->filename);
+    pa_proplist_setf(data.proplist, PA_PROP_DEVICE_DESCRIPTION, "Xen PV audio sink");
     pa_sink_new_data_set_sample_spec(&data, &ss);
     pa_sink_new_data_set_channel_map(&data, &map);
 
@@ -538,7 +538,7 @@ int alloc_gref(struct ioctl_gntalloc_alloc_gref *gref, void **addr)
     }
 
     printf("Got grant #%d. Mapped locally at %Ld=%p\n",
-            gref->gref_ids[0], gref->index, *addr);
+            gref->gref_ids[0], (long long)gref->index, *addr);
 
     /* skip this for now
        struct ioctl_gntalloc_unmap_notify uarg = {
@@ -634,7 +634,7 @@ int ring_wait_for_event()
         }
 }
 
-int publish_param(char *paramname, char *value)
+int publish_param(const char *paramname, const char *value)
 {
     char keybuf[128], valbuf[32];
 
@@ -643,7 +643,7 @@ int publish_param(char *paramname, char *value)
     return xs_write(xsh, 0, keybuf, valbuf, strlen(valbuf));
 }
 
-int publish_param_int(char *paramname, int value)
+int publish_param_int(const char *paramname, const int value)
 {
     char keybuf[128], valbuf[32];
     snprintf(keybuf, sizeof keybuf, "device/audio/%d/%s", device_id, paramname);
@@ -653,8 +653,8 @@ int publish_param_int(char *paramname, int value)
 
 char* read_param(char *paramname)
 {
-    char keybuf[128], valbuf[32];
-    int len;
+    char keybuf[128];
+    unsigned int len;
     int my_domid;
 
     my_domid = atoi(xs_read(xsh, 0, "domid", &len));
