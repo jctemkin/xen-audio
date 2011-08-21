@@ -65,7 +65,7 @@ PA_MODULE_USAGE(
         "channel_map=<channel map>");
 
 #define DEFAULT_FILE_NAME "/tmp/music.input"
-#define DEFAULT_SOURCE_NAME "fifo_input"
+#define DEFAULT_SOURCE_NAME "xen_input"
 
 int device_id = -1;
 enum xenbus_state
@@ -179,7 +179,7 @@ static void thread_func(void *userdata) {
     int read_type = 0;
 
     pa_assert(u);
-
+        fflush(stdout);printf("finish\n");fflush(stdout);
     pa_log_debug("Thread starting up");
 
     pa_thread_mq_install(&u->thread_mq);
@@ -203,6 +203,7 @@ static void thread_func(void *userdata) {
             pa_assert(pa_memblock_get_length(u->memchunk.memblock) > u->memchunk.index);
 
             p = pa_memblock_acquire(u->memchunk.memblock);
+            xc_evtchn_notify(xce, xen_evtchn_port);
             l = ring_read(ioring, (uint8_t*)(p+u->memchunk.index), pa_memblock_get_length(u->memchunk.memblock) - u->memchunk.index);
             pa_memblock_release(u->memchunk.memblock);
 
@@ -315,7 +316,7 @@ int pa__init(pa_module*m) {
     publish_spec(&ss);
 
     //2. set watch on backend state
-    snprintf(keybuf, sizeof(keybuf), "/local/domain/0/backend/audio/%d/%d/state", my_domid, device_id);
+    snprintf(keybuf, sizeof(keybuf), "/local/domain/0/backend/audio-source/%d/%d/state", my_domid, device_id);
     if (!xs_watch(xsh, keybuf, "mytoken")) perror("xs_watch");
 
     //3. read the backend state
@@ -374,8 +375,8 @@ int pa__init(pa_module*m) {
     data.driver = __FILE__;
     data.module = m;
     pa_source_new_data_set_name(&data, pa_modargs_get_value(ma, "source_name", DEFAULT_SOURCE_NAME));
-    pa_proplist_sets(data.proplist, PA_PROP_DEVICE_STRING, u->filename);
-    pa_proplist_setf(data.proplist, PA_PROP_DEVICE_DESCRIPTION, "Unix FIFO source %s", u->filename);
+    //pa_proplist_sets(data.proplist, PA_PROP_DEVICE_STRING, u->filename);
+    pa_proplist_setf(data.proplist, PA_PROP_DEVICE_DESCRIPTION, "Xen PV source %s", u->filename);
     pa_source_new_data_set_sample_spec(&data, &ss);
     pa_source_new_data_set_channel_map(&data, &map);
 
@@ -474,7 +475,7 @@ void pa__done(pa_module*m) {
 
     pa_xfree(u);
 
-    snprintf(keybuf, sizeof(keybuf), "device/audio/%d", device_id);
+    snprintf(keybuf, sizeof(keybuf), "device/audio-source/%d", device_id);
     //delete xenstore keys
     xs_rm(xsh, 0, keybuf);
 
@@ -613,7 +614,7 @@ int publish_param(const char *paramname, const char *value)
 {
     char keybuf[128], valbuf[32];
 
-    snprintf(keybuf, sizeof keybuf, "device/audio/%d/%s", device_id, paramname);
+    snprintf(keybuf, sizeof keybuf, "device/audio-source/%d/%s", device_id, paramname);
     snprintf(valbuf, sizeof valbuf, "%s", value);
     return xs_write(xsh, 0, keybuf, valbuf, strlen(valbuf));
 }
@@ -621,7 +622,7 @@ int publish_param(const char *paramname, const char *value)
 int publish_param_int(const char *paramname, const int value)
 {
     char keybuf[128], valbuf[32];
-    snprintf(keybuf, sizeof keybuf, "device/audio/%d/%s", device_id, paramname);
+    snprintf(keybuf, sizeof keybuf, "device/audio-source/%d/%s", device_id, paramname);
     snprintf(valbuf, sizeof valbuf, "%d", value);
     return xs_write(xsh, 0, keybuf, valbuf, strlen(valbuf));
 }
@@ -633,7 +634,7 @@ char* read_param(char *paramname)
     int my_domid;
 
     my_domid = atoi(xs_read(xsh, 0, "domid", &len));
-    snprintf(keybuf, sizeof(keybuf), "/local/domain/0/backend/audio/%d/%d/%s", my_domid, device_id, paramname);
+    snprintf(keybuf, sizeof(keybuf), "/local/domain/0/backend/audio-source/%d/%d/%s", my_domid, device_id, paramname);
     //remember to free lvalue!
     return xs_read(xsh, 0, keybuf, &len);
 }
@@ -684,9 +685,11 @@ int ring_read(struct ring *ioring, void *dest, int length)
         //putchar(*(ioring->buffer+ioring->cons_indx));
         //write(dspfd, ioring->buffer+ioring->cons_indx, 1);
         //wrap
+        //printf("read %d bytes\n", rl);
         ioring->cons_indx = (ioring->cons_indx+rl)%sizeof(ioring->buffer);
 
         r+=rl;
     }
+        //usleep(1000);
     return r;
 }

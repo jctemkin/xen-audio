@@ -130,7 +130,7 @@ static const char* const valid_modargs[] = {
     "channel_map",
     NULL
 };
-
+watch_first_time = 1;
 // Xen globals
 /*xc_evtchn_t, xc_interface */
 xc_interface* xch;
@@ -189,7 +189,9 @@ static int process_render(struct userdata *u) {
         p = pa_memblock_acquire(u->memchunk.memblock);
 	    //xen: write data to ring buffer & notify backend
         l = ring_write(ioring, (uint8_t*)p + u->memchunk.index, u->memchunk.length);
+        /* TODO: limit events to process_render calls? */
         xc_evtchn_notify(xce, xen_evtchn_port);
+
         pa_memblock_release(u->memchunk.memblock);
 
         pa_assert(l != 0);
@@ -278,17 +280,17 @@ finish:
 }
 
 int pa__init(pa_module*m) {
+
     struct userdata *u;
     pa_sample_spec ss;
     pa_channel_map map;
     pa_modargs *ma;
-    //struct pollfd *pollfd;
     pa_sink_new_data data;
     char keybuf[128];
     char *buf;
     unsigned int len;
-    char **vec;
     unsigned int my_domid, num_strings;
+    int backend_state;
 
     total_bytes = 0;
     pa_assert(m);
@@ -298,7 +300,7 @@ int pa__init(pa_module*m) {
         goto fail;
     }
 
-    //Xen init
+    /* Xen Basic init */
     xsh = xs_domain_open();
     if(xsh==NULL){ pa_log("xs_domain_open failed"); goto fail; }
 
@@ -308,16 +310,27 @@ int pa__init(pa_module*m) {
     xce = xc_evtchn_open(NULL, 0);
     if(xce==0){ pa_log("xc_evtchn_open failed"); goto fail; }
 
-    //use only dom0 as the backend for now
+    /* use only dom0 as the backend for now */
     xen_evtchn_port = xc_evtchn_bind_unbound_port(xce, 0);
-    if(xen_evtchn_port<0){ pa_log("xc_evtchn_bind_unbound_port failed"); }
+    if(xen_evtchn_port<0){ 
+        pa_log("xc_evtchn_bind_unbound_port failed");
+    }
 
-    //get grant reference & map locally
-    if(alloc_gref(&gref, (void**)&ioring)){ pa_log("alloc_gref failed");};
-    device_id = 0;//(int)gref.gref_ids[0];
+    /* get grant reference & map locally */
+    if(alloc_gref(&gref, (void**)&ioring)){
+       pa_log("alloc_gref failed");
+    };
+    device_id = 0; /* hardcoded for now */
 
     my_domid = atoi(xs_read(xsh, 0, "domid", &len));
 
+    /* Basic initialization ended, make frontend's presence known */
+    printf("STATE=XenbusStateUnknown : Waiting for backend XenbusStateUnknown\n");
+    publish_param_int("state", XenbusStateUnknown);
+    /* wait for backend to appear */
+    backend_state = wait_for_backend_state_change();/*XenbusStateUnknown*/
+    printf("STATE=XenbusStateUnknown : backend state was %d\n", backend_state);
+    /* Begin Phase 1 */
     //post event chan & grant reference to xenstore
     publish_param_int("event-channel", xen_evtchn_port);
     publish_param_int("ring-ref", gref.gref_ids[0]);
@@ -329,58 +342,44 @@ int pa__init(pa_module*m) {
         goto fail;
     }
 
-    //// Start negiotiation
-    //
-    //1. publish frontend parameters
     publish_spec(&ss);
+    /* wait for backend to post its own parameters; this should be XenbusStateInitializing */
+    printf("STATE=XenbusStateInitialising : Waiting for backend XenbusStateInitialising\n");
+    publish_param_int("state", XenbusStateInitialising);
+    backend_state = wait_for_backend_state_change();
+    printf("STATE=XenbusStateInitialising : backend state was %d\n", backend_state);
 
-    //2. set watch on backend state
-    snprintf(keybuf, sizeof(keybuf), "/local/domain/0/backend/audio/%d/%d/state", my_domid, device_id);
-    if (!xs_watch(xsh, keybuf, "mytoken")) perror("xs_watch");
-
-    //3. read the backend state
-    //XenbusStateInitialising := backend has not responded yet
-    //XenbusStateReconfiguring := sample spec unsupported
-    //XenbusStateInitialised := sample spec OK
-    int backend_state = 0;
-    // read initial state and discard
-    if(!(vec=xs_read_watch(xsh, &num_strings))) perror("xs_read_watch");
-
-    //4. wait for backend response
-    do{
-        if(!(vec=xs_read_watch(xsh, &num_strings))) perror("xs_read_watch");
-        
-        printf("vec contents: %s|%s\n", vec[XS_WATCH_PATH], vec[XS_WATCH_TOKEN]);
-
-        buf = xs_read(xsh, 0, vec[XS_WATCH_PATH], &len);
-        backend_state = atoi(buf);
-    } while(backend_state!=XenbusStateInitialised && \
-            backend_state!=XenbusStateReconfiguring);
+    /* Begin Phase 2 */
     
-    //5. Two outcomes:
+    while(1) {
+        printf("STATE=XenbusStateInitialising : Waiting for backend XenbusStateInitialised\n");
+        publish_param_int("state", XenbusStateInitialised);
+        backend_state = wait_for_backend_state_change();
+        printf("STATE=XenbusStateInitialising : backend state was %d\n", backend_state);
 
-    //backend rejected sample spec?
-    if(backend_state!=XenbusStateInitialised){
-        //simple fallback; accept backend's parameters
-        read_spec(&ss);
+        if(backend_state==XenbusStateReconfiguring){
+            /* simple fallback; accept backend's parameters */
+            read_spec(&ss);
+            /* backend should accept these now as well*/
+            publish_spec(&ss);
+            /* set state to notify backend that we posted new parameters */
+            printf("STATE=XenbusStateReconfiguring : backend state was %d\n", backend_state);
+            publish_param_int("state", XenbusStateReconfiguring);
+        }
+        else if(backend_state==XenbusStateConnected){
+            /* backend accepted our parameters, negotiation is over */
+            publish_param_int("state", XenbusStateConnected);
+            printf("STATE=XenbusStateConnected : backend state was %d\n", backend_state);
+            break;
+        }
     }
-    /*else: sample spec was accepted, go on*/
 
-    publish_param_int("state", XenbusStateInitialised);
     char sss[100];
     pa_sample_spec_snprint(sss, 100, &ss);
     puts(sss);
-    //
-    ////End of negotiation
-    
-    /*
-    if(!(vec=xs_read_watch(xsh, &num_strings))) perror("xs_read_watch");
-    printf("vec contents: %s|%s\n", vec[XS_WATCH_PATH], vec[XS_WATCH_TOKEN]);
-    */
-    
-    //set status to initialised
 
-
+    /* End of Phase 2, begin playback cycle */
+    
     u = pa_xnew0(struct userdata, 1);
     u->core = m->core;
     u->module = m;
@@ -499,15 +498,17 @@ void pa__done(pa_module*m) {
 
     pa_xfree(u);
 
-    snprintf(keybuf, sizeof(keybuf), "device/audio/%d", device_id);
+    publish_param_int("state", XenbusStateClosing);
     //delete xenstore keys
+    snprintf(keybuf, sizeof(keybuf), "device/audio/%d", device_id);
     xs_rm(xsh, 0, keybuf);
-
-    //munmap((void*)gref.index, 4096);
-
+    munmap((void*)gref.index, 4096);
     //close xen interfaces
     xc_evtchn_close(xce);
     xc_interface_close(xch);
+
+    publish_param_int("state", XenbusStateClosed);
+    xs_rm(xsh, 0, "/local/domain/0/backend/audio");
     xs_daemon_close(xsh);
 }
 
@@ -694,4 +695,37 @@ int read_spec(pa_sample_spec *ss){
     free(out);
 
     return 0;
+}
+
+int wait_for_backend_state_change()
+{
+    char buf[128], *pbuf;
+    int len;
+    int backend_state;
+    int num_strings;
+    int my_domid;
+    char **vec;
+    static first_time = 1;
+
+    if(first_time){
+        my_domid = atoi(xs_read(xsh, 0, "domid", &len));
+        snprintf(buf, sizeof(buf), "/local/domain/0/backend/audio/%d/%d/state", my_domid, device_id);
+        if (!xs_watch(xsh, buf, "xenpvaudiofrontendsinktoken")) perror("xs_watch failed");
+        first_time = 0;
+        if(!(vec=xs_read_watch(xsh, &num_strings))) perror("xs_read_watch failed");
+        printf("vec contents: %s|%s\n", vec[XS_WATCH_PATH], vec[XS_WATCH_TOKEN]);
+    }
+
+    if(!(vec=xs_read_watch(xsh, &num_strings))) perror("xs_read_watch failed");
+    printf("vec contents: %s|%s\n", vec[XS_WATCH_PATH], vec[XS_WATCH_TOKEN]);
+    //if(!(vec=xs_read_watch(xsh, &num_strings))) perror("xs_read_watch failed");
+    //printf("vec contents: %s|%s\n", vec[XS_WATCH_PATH], vec[XS_WATCH_TOKEN]);
+    
+    pbuf = xs_read(xsh, 0, vec[XS_WATCH_PATH], &len);
+    puts(pbuf);
+    puts("reached here");fflush(stdout);
+    backend_state = atoi(pbuf);
+    //free(pbuf);
+
+    return backend_state;
 }

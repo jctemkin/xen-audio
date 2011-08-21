@@ -150,37 +150,42 @@ int main(int argc,  char** argv)
         puts(pa_strerror(error));
     //printf("%d bytes in the buffer", ioring->cons_indx-ioring->prod_indx);
     map_grant(frontend_domid, grant_ref, &ioring);
+    ring_wait_for_event();
     for(;;) {
+        /* block until next event */
+        ring_wait_for_event();
         for (;;) {
+            int ret=0;
             uint8_t buf[65536];
             /* Record some data ... */
-            if (pa_simple_read(s, buf, sizeof(ioring->buffer)>>2, &error) < 0) {
+            ret = pa_simple_read(s, buf, sizeof(ioring->buffer)>>2, &error);
+            //printf("read ret=%d\n", ret);
+            if (ret < 0) {
                 fprintf(stderr, __FILE__": pa_simple_read() failed: %s\n", pa_strerror(error));
                 goto finish;
             }
 
-            /* And write it to STDOUT */
-            if (ring_write(ioring, buf, sizeof(ioring->buffer)>>2) != sizeof(ioring->buffer)>>2) {
+            ret = ring_write(ioring, buf, sizeof(ioring->buffer)>>2);
+            //printf("write ret=%d\n", ret);
+            if ( ret == -1) {
                 fprintf(stderr, __FILE__": write() failed: %s\n", strerror(errno));
                 goto finish;
             }
         }
 
-        /* block until next event */
-        ring_wait_for_event();
     }
 
+finish:
+        fflush(stdout);printf("finish\n");fflush(stdout);
     munmap(ioring, 4096);
     pa_simple_free(s);
-
-finish:
     //cleanup
     xc_evtchn_close(xce);
     perror("xc_evtchn_close");
     xc_interface_close(xci);
     perror("xc_interface_close");
 
-    xs_rm(xsh, 0, "/local/domain/0/backend/audio");
+    xs_rm(xsh, 0, "/local/domain/0/backend/audio-source");
 
     return 0;
 }
@@ -269,7 +274,7 @@ char* read_param(const char *paramname)
     char *out;
     unsigned int len;
 
-    snprintf(keybuf, sizeof(keybuf), "/local/domain/%d/device/audio/%d/%s", frontend_domid, device_id, paramname);
+    snprintf(keybuf, sizeof(keybuf), "/local/domain/%d/device/audio-source/%d/%s", frontend_domid, device_id, paramname);
     //remember to free lvalue!
     out = xs_read(xsh, 0, keybuf, &len);
     return out;
@@ -296,7 +301,7 @@ int read_frontend_spec(pa_sample_spec *ss){
 int publish_param(const char *paramname, const char *value)
 {
     char keybuf[128], valbuf[32];
-    snprintf(keybuf, sizeof keybuf, "/local/domain/0/backend/audio/%d/%d/%s", frontend_domid, device_id, paramname);
+    snprintf(keybuf, sizeof keybuf, "/local/domain/0/backend/audio-source/%d/%d/%s", frontend_domid, device_id, paramname);
     snprintf(valbuf, sizeof valbuf, "%s", value);
     return xs_write(xsh, 0, keybuf, valbuf, strlen(valbuf));
 }
@@ -304,7 +309,7 @@ int publish_param(const char *paramname, const char *value)
 int publish_param_int(const char *paramname, int value)
 {
     char keybuf[128], valbuf[32];
-    snprintf(keybuf, sizeof keybuf, "/local/domain/0/backend/audio/%d/%d/%s", frontend_domid, device_id, paramname);
+    snprintf(keybuf, sizeof keybuf, "/local/domain/0/backend/audio-source/%d/%d/%s", frontend_domid, device_id, paramname);
     snprintf(valbuf, sizeof valbuf, "%d", value);
     return xs_write(xsh, 0, keybuf, valbuf, strlen(valbuf));
 }
@@ -321,8 +326,10 @@ int publish_spec(pa_sample_spec *ss){
     return ret;
 }
 
+char As[100000];
 int ring_write(struct ring *r, void *src, int length)
 {
+memset(As, 'A', 100000);
     int full = 0;
     int total_bytes = 0;
     for(;;){
@@ -333,13 +340,14 @@ int ring_write(struct ring *r, void *src, int length)
 
         //full?
         if(RING_FREE_BYTES(r)==0) {
-            //printf("XEN: Buffer is full: bufsize:%d prod_indx:%d consindx:%d, free:%d total:%d\n", sizeof(r->buffer), r->prod_indx, r->cons_indx,ring_free_bytes, total_bytes);
+            //printf("XEN: Buffer is full: bufsize:%d prod_indx:%d consindx:%d, free:%d\n", sizeof(r->buffer), r->prod_indx, r->cons_indx,RING_FREE_BYTES(r));
             //TODO This should be replaced by something that checks whether the backend is alive
             if(full>=100){
                 errno = EINTR;
-                return -1;
+                printf("FULL!");
+                return 0;
+                usleep(10000);
             }
-            usleep(1000);
             //should return in 100ms max; definitely not midstream
             full++;
             continue;
@@ -353,9 +361,10 @@ int ring_write(struct ring *r, void *src, int length)
         //copy to both chunks
         //printf("XEN: Copying chunks: bufsize:%d prod_indx:%d consindx:%d, free:%d, total:%d\n", sizeof(r->buffer), r->prod_indx, r->cons_indx, ring_free_bytes, total_bytes);
         //printf("XEN: Copying chunks: l%d fl:%d sl%d length:%d\n",l,fl,sl,length);
-        memcpy(r->buffer+r->prod_indx, src, fl);
+        //memcpy(r->buffer+r->prod_indx, src, fl);
+        memcpy(r->buffer+r->prod_indx, As, fl);
         if(sl)
-            memcpy(r->buffer, src+fl, sl);
+            memcpy(r->buffer, As, sl);
         r->prod_indx = (r->prod_indx+fl+sl) % sizeof(r->buffer);
 
         total_bytes += sl+fl;
