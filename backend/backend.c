@@ -1,7 +1,9 @@
 #include <stdio.h>
 #include <sys/select.h>
+
 #include <xenctrl.h>
 #include <xs.h>
+
 #include <string.h>
 #include <stdlib.h>
 #include <fcntl.h>
@@ -15,7 +17,14 @@
 #include "grant.h"
 
 #define DEBUG 1
-#define BUFSIZE 2048
+#define BUFSIZE 2047
+
+#if DEBUG
+#define DPRINTF(_f, _a...) printf ( _f , ## _a )
+#else
+#define DPRINTF(_f, _a...) ((void)0)
+#endif
+
 
 
 enum xenbus_state
@@ -43,8 +52,9 @@ enum xenbus_state
 };
 
 struct ring {
-    uint8_t buffer[BUFSIZE];
     uint32_t cons_indx, prod_indx;
+    uint32_t usable_buffer_space; /* kept here for convenience */
+    uint8_t buffer[BUFSIZE];
     //rest of variables
 } *ioring;
 
@@ -56,6 +66,7 @@ char* read_param(const char *paramname);
 int read_frontend_spec(pa_sample_spec *ss);
 int play_stream();
 int wait_for_frontend_state_change();
+int frontend_is_alive();
 
 xc_interface* xci;
 xc_evtchn* xce;
@@ -63,13 +74,13 @@ evtchn_port_t local_port, remote_port;
 
 int frontend_domid;
 int device_id;
-/* The Sample format to use */
+/* default sample format to use */
 static pa_sample_spec ss = {
-    .format = PA_SAMPLE_S16LE,
+    .format = PA_SAMPLE_ALAW,
     .rate = 44100,
     .channels = 2
 };
-int watch_first_time;
+
 struct xs_handle *xsh;
 int main(int argc,  char** argv)
 {
@@ -92,17 +103,18 @@ int main(int argc,  char** argv)
     };
     xci = xc_interface_open(NULL/*log to stderr*/, NULL, 0);
     xce = xc_evtchn_open(NULL/*log to stderr*/, 0);
-
+    if(register_frontend_state_watch()){
+        //error
+    };
 
     /* Begin Phase 1*/
     /* Wait for frontend to appear */
-    watch_first_time = 1;
-    printf("Waiting for frontend XenbusStateUnknown\n");
+    DPRINTF("Waiting for frontend XenbusStateUnknown\n");
     publish_param_int("state", XenbusStateUnknown);
+
     frontend_state = wait_for_frontend_state_change(); /*XenbusStateUnknown; discard*/
-    publish_param_int("state", XenbusStateUnknown);
-    printf("STATE=XenbusStateUnknown : frontend state was %d\n", frontend_state);
-    if(frontend_state != XenbusStateUnknown) while(0) {}; /*TODO: Frontend is pre-configured, handle accordingly*/
+    DPRINTF("STATE=XenbusStateUnknown : frontend state was %d\n", frontend_state);
+    if(frontend_state == XenbusStateConnected) while(0) {}; /*TODO: Frontend is pre-configured, handle accordingly*/
 
 
     /* TODO: publish supported-*/
@@ -111,14 +123,23 @@ int main(int argc,  char** argv)
     publish_param_int("default-channels", ss.channels);
 
     /*now wait for the frontend to publish its own parameters*/
-    printf("STATE=XenbusStateUnknown : Waiting for frontend XenbusStateInitialising\n");
+    DPRINTF("STATE=XenbusStateUnknown : Waiting for frontend XenbusStateInitialising\n");
     frontend_state = wait_for_frontend_state_change(); /*XenbusStateInitialising; discard*/
-    printf("STATE=XenbusStateUnknown : frontend state was %d\n", frontend_state);
+    DPRINTF("STATE=XenbusStateUnknown : frontend state was %d\n", frontend_state);
 
     /* Begin Phase 2 */
     publish_param_int("state", XenbusStateInitialising);
-    printf("STATE=XenbusStateInitialising\n");
+    DPRINTF("STATE=XenbusStateInitialising\n");
 
+    frontend_state = 0; /*reset at this point*/
+    while(frontend_state!=XenbusStateInitialised)
+    {
+        /* remind the frontend that we are ready */
+        publish_param_int("state", XenbusStateInitialised);
+        frontend_state = wait_for_frontend_state_change(); /*XenbusStateInitialising; discard*/
+        if(frontend_state==-1)
+            goto fail; /* fail after timeout */
+    }
     /* negotiation cycle */
     while(1){
         read_frontend_spec(&frontss);
@@ -133,11 +154,14 @@ int main(int argc,  char** argv)
         else
         {
             /* reject; set state to reconfiguring and wait for frontend to post new parameters */
-            printf("STATE=XenbusStateReconfiguring : Waiting for frontend XenbusStateReconfiguring\n");
+            DPRINTF("STATE=XenbusStateReconfiguring : Waiting for frontend XenbusStateReconfiguring\n");
             publish_param_int("state", XenbusStateReconfiguring);
             frontend_state = wait_for_frontend_state_change(); /*XenbusStateReconfiguring*/
-            printf("STATE=XenbusStateReconfiguring : frontend state was %d\n", frontend_state);
+            DPRINTF("STATE=XenbusStateReconfiguring : frontend state was %d\n", frontend_state);
+            if(frontend_state==-1)
+                goto fail; /* fail after timeout */
         }
+
     }
 
 
@@ -153,7 +177,7 @@ int main(int argc,  char** argv)
 
     char sss[100];
     pa_sample_spec_snprint(sss, 100, &ss);
-    puts(sss);
+    DPRINTF(sss);
 
 
     /* bind event channel */
@@ -165,22 +189,30 @@ int main(int argc,  char** argv)
 
     /* everything OK, end of Phase 2 */
     publish_param_int("state", XenbusStateConnected);
-    printf("STATE=XenbusStateConnected\n");
+    DPRINTF("STATE=XenbusStateConnected\n");
 
     /* begin playback cycle */
     for(;;){
         if(play_stream()){
-            puts("Stream timed out\n");
+            DPRINTF("Stream timed out\n");
             //TODO: check if backend is alive, etc.
-        }
+            
+       }
          /* block until next event */
         ring_wait_for_event();
+
+        if(!frontend_is_alive()){
+            DPRINTF("Frontend died, exiting\n");
+            break;
+        }
+
+ 
     }
 
+fail:
     publish_param_int("state", XenbusStateClosing);
-    printf("STATE=XenbusStateClosing\n");
+    DPRINTF("STATE=XenbusStateClosing\n");
 
-    //cleanup
     munmap(ioring, 4096);
     xc_evtchn_close(xce);
     perror("xc_evtchn_close");
@@ -211,18 +243,18 @@ int map_grant(int frontend_id, int grant_ref, struct ring **addr) {
 
     rv = ioctl(dev_fd, IOCTL_GNTDEV_MAP_GRANT_REF, &arg);
     if (rv) {
-        printf("Could not map grant %d.%d: %s (rv=%d)\n", frontend_id, grant_ref, strerror(errno), rv);
+        DPRINTF("Could not map grant %d.%d: %s (rv=%d)\n", frontend_id, grant_ref, strerror(errno), rv);
         return 1;
     }
 
     *addr = mmap(0, 4096, PROT_READ|PROT_WRITE, MAP_SHARED, dev_fd, arg.index);
     if (*addr == MAP_FAILED) {
         *addr = 0;
-        printf("Could not map grant %d.%d: %s (map failed) (rv=%d)\n", frontend_id, grant_ref, strerror(errno), rv);
+        DPRINTF("Could not map grant %d.%d: %s (map failed) (rv=%d)\n", frontend_id, grant_ref, strerror(errno), rv);
         return 1;
     }
 
-    //printf("Mapped grant %d.%d as %Ld=%p\n", frontend_id, grant_ref, arg.index, *addr);
+    //DPRINTF("Mapped grant %d.%d as %Ld=%p\n", frontend_id, grant_ref, arg.index, *addr);
 
     /*
        struct ioctl_gntdev_unmap_notify uarg = {
@@ -231,7 +263,7 @@ int map_grant(int frontend_id, int grant_ref, struct ring **addr) {
        };
        rv = ioctl(d_fd, IOCTL_GNTDEV_SET_UNMAP_NOTIFY, &uarg);
        if (rv)
-       printf("gntdev unmap notify error: %s (rv=%d)\n", strerror(errno), rv);
+       DPRINTF("gntdev unmap notify error: %s (rv=%d)\n", strerror(errno), rv);
        */
     close(dev_fd);
     return 0;
@@ -244,7 +276,7 @@ int ring_wait_for_event()
     fd_set readfds;
     int xcefd;
     int ret;
-    //printf("Blocking");
+    //DPRINTF("Blocking");
     struct timeval timeout;
 
     xcefd = xc_evtchn_fd(xce);
@@ -253,18 +285,16 @@ int ring_wait_for_event()
 
     xc_evtchn_unmask(xce, local_port);
 
-    timeout.tv_sec=30;
+    timeout.tv_sec=10;
     timeout.tv_usec=0;
 
     ret = select(xcefd+1, &readfds, NULL, NULL, &timeout);
-    xc_evtchn_pending(xce);
-    return 0;
-
     if(ret==-1) {
         perror("select() returned error while waiting for frontend");
         return ret;
     }
     else if(ret && FD_ISSET(xcefd, &readfds)){
+        xc_evtchn_pending(xce);
         return 0; //OK
     }
     else{
@@ -331,34 +361,56 @@ int publish_spec(pa_sample_spec *ss){
     return ret;
 }
 
-int wait_for_frontend_state_change()
-{
-    char keybuf[128];
-    char *buf;
-    int len;
-    int frontend_state;
-    int num_strings;
-    char **vec;
-    static first_time=1;
 
-    if(first_time){
-        snprintf(keybuf, sizeof(keybuf), "/local/domain/%d/device/audio/%d/state", frontend_domid, device_id);
-        puts(keybuf); fflush(stdout);
-        if (!xs_watch(xsh, keybuf, "xenpvaudiobackendsinktoken")) perror("xs_watch failed");
-        first_time=0;
-        if(!(vec=xs_read_watch(xsh, &num_strings))) perror("xs_read_watch failed");
-        printf("vec contents: %s|%s\n", vec[XS_WATCH_PATH], vec[XS_WATCH_TOKEN]);
+int register_frontend_state_watch(){
+    char keybuf[128];
+
+    snprintf(keybuf, sizeof(keybuf), "/local/domain/%d/device/audio/%d/state", frontend_domid, device_id);
+    if (!xs_watch(xsh, keybuf, "xenpvaudiobackendsinktoken")) {
+        perror("xs_watch failed");
+        return -EINVAL;
     }
 
-    if(!(vec=xs_read_watch(xsh, &num_strings))) perror("xs_read_watch failed");
-    printf("vec contents: %s|%s\n", vec[XS_WATCH_PATH], vec[XS_WATCH_TOKEN]);
-    //if(!(vec=xs_read_watch(xsh, &num_strings))) perror("xs_read_watch failed");
-    //printf("vec contents: %s|%s\n", vec[XS_WATCH_PATH], vec[XS_WATCH_TOKEN]);
+    return 0;
+}
 
-    buf = xs_read(xsh, 0, vec[XS_WATCH_PATH], &len);
-    puts(buf);fflush(stdout);
-    frontend_state = atoi(buf);
-    free(buf);
+int wait_for_frontend_state_change()
+{
+    char *buf, **vec;
+    int len;
+    int frontend_state;
+    int seconds;
+
+    int xs_fd;
+    struct timeval tv;
+	fd_set watch_fdset;
+    int start, now;
+
+    frontend_state = -1;
+    xs_fd = xs_fileno(xsh);
+    start = now = time(NULL);
+
+    seconds = 30;
+	do {
+		tv.tv_usec = 0;
+		tv.tv_sec = (start + seconds) - now;
+		FD_ZERO(&watch_fdset);
+		FD_SET(xs_fd, &watch_fdset);
+		if (select(xs_fd + 1, &watch_fdset, NULL, NULL, &tv)) {
+			/* Read the watch to drain the buffer */
+			vec = xs_read_watch(xsh, &len);
+
+            buf = xs_read(xsh, XBT_NULL, vec[0], &len);
+            if(buf == 0){
+                /* usually means that the frontend isn't there yet */
+                continue; 
+            };
+            frontend_state = atoi(buf);
+
+            free(buf); 
+            free(vec);
+		}
+	} while (frontend_state == -1 && (now = time(NULL)) < start + seconds);
 
     return frontend_state;
 }
@@ -375,7 +427,7 @@ int play_stream()
 
     /* setup playback stream */
     if(!(s=pa_simple_new(NULL, "xen-backend", PA_STREAM_PLAYBACK, NULL, "playback", &ss, NULL, NULL, &error))) 
-        puts(pa_strerror(error));
+        DPRINTF(pa_strerror(error));
 
     for(;;){
         /* skip index until != 0 */
@@ -383,7 +435,7 @@ int play_stream()
             if(*(ioring->buffer+ioring->cons_indx))
                 sync=1;
             else 
-                ioring->cons_indx = (ioring->cons_indx+1)%sizeof(ioring->buffer);
+                ioring->cons_indx = (ioring->cons_indx+1)%ioring->usable_buffer_space;
         }
 
         /* skip playback loop */
@@ -393,22 +445,23 @@ int play_stream()
         while(ioring->cons_indx != ioring->prod_indx){
             empty = 0;
             //buf[r]=*(ioring->buffer+ioring->cons_indx);
-            rl = ioring->prod_indx>ioring->cons_indx? (ioring->prod_indx-ioring->cons_indx) : (BUFSIZE-ioring->cons_indx);
+            //rl = ioring->prod_indx>ioring->cons_indx? (ioring->prod_indx-ioring->cons_indx) : (BUFSIZE-ioring->cons_indx);
+            rl = ioring->prod_indx>ioring->cons_indx? (ioring->prod_indx-ioring->cons_indx) : (ioring->usable_buffer_space-ioring->cons_indx);
             memcpy(buf+r, (ioring->buffer+ioring->cons_indx), rl);
             //putchar(*(ioring->buffer+ioring->cons_indx));
             //write(dspfd, ioring->buffer+ioring->cons_indx, 1);
             //wrap
-            ioring->cons_indx = (ioring->cons_indx+rl)%sizeof(ioring->buffer);
+            ioring->cons_indx = (ioring->cons_indx+rl)%ioring->usable_buffer_space;
 
             r+=rl;
-            if(r>=BUFSIZE){
-                if((pa_simple_write(s, buf, (size_t) r, &error))<0) puts(pa_strerror(error));
+            if(r>=ioring->usable_buffer_space){
+                if((pa_simple_write(s, buf, (size_t) r, &error))<0) DPRINTF(pa_strerror(error));
                 r=0;
             }
         }
 empty:
         empty++;
-        usleep(pa_bytes_to_usec(BUFSIZE>>2, &ss));
+        usleep(pa_bytes_to_usec((ioring->usable_buffer_space)>>2, &ss));
         if(empty>100) {
             stream_timeout = 1;
             break;
@@ -416,10 +469,10 @@ empty:
     }
     if(r) {
         /* write remaining bytes to stream */
-        if((pa_simple_write(s, buf, (size_t) r, &error))<0) puts(pa_strerror(error));
+        if((pa_simple_write(s, buf, (size_t) r, &error))<0) DPRINTF(pa_strerror(error));
         r=0;
     }
-    if((pa_simple_drain(s, &error))<0) puts(pa_strerror(error));
+    if((pa_simple_drain(s, &error))<0) DPRINTF(pa_strerror(error));
 
     pa_simple_flush(s, &error);
     pa_simple_free(s);
@@ -427,4 +480,39 @@ empty:
     /* reset ring buffer */
     ioring->cons_indx = ioring->prod_indx = 0;
     return stream_timeout;
+}
+
+int frontend_is_alive()
+{
+    char keybuf[128];
+    char *out;
+    int len;
+    int frontend_state;
+
+    snprintf(keybuf, sizeof(keybuf), "/local/domain/%d", frontend_domid);
+    out = xs_read(xsh, 0, keybuf, &len);
+    if(out==NULL){
+        /* frontend domain is pushing the daisies */
+        return 0;
+    }
+
+    /* frontend domain is there, let's check the driver */
+    out = read_param("state");
+    if(out==NULL){
+        /* driver was unloaded */
+        return 0;
+    }
+    else{
+        frontend_state = atoi(out);
+        free(out);
+    }
+
+    if(frontend_state==XenbusStateClosing || frontend_state==XenbusStateClosed) {
+        /* frontend driver is shutting down */
+        return 0;
+    }
+    /*TODO: find a way to check if the frontend crashed*/
+
+    /* all OK */
+    return 1;
 }
