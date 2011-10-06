@@ -17,6 +17,8 @@
 #include "grant.h"
 
 #define DEBUG 1
+
+#define EVENT_TIMEOUT_SECONDS 60
 #define BUFSIZE 2047
 
 #if DEBUG
@@ -24,8 +26,6 @@
 #else
 #define DPRINTF(_f, _a...) ((void)0)
 #endif
-
-
 
 enum xenbus_state
 {
@@ -67,6 +67,8 @@ int read_frontend_spec(pa_sample_spec *ss);
 int play_stream();
 int wait_for_frontend_state_change();
 int frontend_is_alive();
+int set_state(int state);
+int register_frontend_state_watch();
 
 xc_interface* xci;
 xc_evtchn* xce;
@@ -76,95 +78,70 @@ int frontend_domid;
 int device_id;
 /* default sample format to use */
 static pa_sample_spec ss = {
-    .format = PA_SAMPLE_ALAW,
+    .format = PA_SAMPLE_S16LE,
     .rate = 44100,
     .channels = 2
 };
-
-struct xs_handle *xsh;
-int main(int argc,  char** argv)
+int state_unknown_cb()
 {
-    int grant_ref;
-    pa_sample_spec frontss;
-    ssize_t r;
-    char *out;
-    bool xerr; /* xen error variable */
-    int error; /* pulseaudio */
-    int frontend_state;
-
-    frontend_domid = atoi(argv[1]);
-
-    device_id = 0; /* hardcoded for now */
-
-    /* Basic Initialization */
-    xsh = xs_domain_open();
-    if(!xs_write(xsh, 0, "/local/domain/0/backend/audio", "", strlen(""))) {
-        perror("xs_write");
-    };
-    xci = xc_interface_open(NULL/*log to stderr*/, NULL, 0);
-    xce = xc_evtchn_open(NULL/*log to stderr*/, 0);
-    if(register_frontend_state_watch()){
-        //error
-    };
-
-    /* Begin Phase 1*/
-    /* Wait for frontend to appear */
-    DPRINTF("Waiting for frontend XenbusStateUnknown\n");
-    publish_param_int("state", XenbusStateUnknown);
-
-    frontend_state = wait_for_frontend_state_change(); /*XenbusStateUnknown; discard*/
-    DPRINTF("STATE=XenbusStateUnknown : frontend state was %d\n", frontend_state);
-    if(frontend_state == XenbusStateConnected) while(0) {}; /*TODO: Frontend is pre-configured, handle accordingly*/
-
+    DPRINTF("frontend state was XenbusStateUnknown\n");
 
     /* TODO: publish supported-*/
     publish_param("default-format", pa_sample_format_to_string(ss.format));
     publish_param_int("default-rate", ss.rate);
     publish_param_int("default-channels", ss.channels);
 
-    /*now wait for the frontend to publish its own parameters*/
-    DPRINTF("STATE=XenbusStateUnknown : Waiting for frontend XenbusStateInitialising\n");
-    frontend_state = wait_for_frontend_state_change(); /*XenbusStateInitialising; discard*/
-    DPRINTF("STATE=XenbusStateUnknown : frontend state was %d\n", frontend_state);
 
-    /* Begin Phase 2 */
-    publish_param_int("state", XenbusStateInitialising);
-    DPRINTF("STATE=XenbusStateInitialising\n");
+    return 0;
+}
 
-    frontend_state = 0; /*reset at this point*/
-    while(frontend_state!=XenbusStateInitialised)
-    {
-        /* remind the frontend that we are ready */
-        publish_param_int("state", XenbusStateInitialised);
-        frontend_state = wait_for_frontend_state_change(); /*XenbusStateInitialising; discard*/
-        if(frontend_state==-1)
-            goto fail; /* fail after timeout */
-    }
+int state_initialising_cb()
+{
+    DPRINTF("frontend state was XenbusStateInitialising\n");
+    set_state(XenbusStateInitialising);
+    return 0;
+}
+
+int state_initwait_cb()
+{
+    DPRINTF("frontend state was XenbusStateInitWait\n");
+    return 0;
+}
+
+int state_initialised_cb()
+{
+    pa_sample_spec frontss;
+    DPRINTF("frontend state was XenbusStateInitialised\n");
+    set_state(XenbusStateInitialised);
     /* negotiation cycle */
-    while(1){
-        read_frontend_spec(&frontss);
+    read_frontend_spec(&frontss);
 
-        if(pa_sample_spec_valid(&frontss) && 
-                pa_usec_to_bytes(1000, &frontss) <= pa_usec_to_bytes(1000, &ss))
-        {
-            /* accept frontend params */
-            read_frontend_spec(&ss);
-            break;
-        }
-        else
-        {
-            /* reject; set state to reconfiguring and wait for frontend to post new parameters */
-            DPRINTF("STATE=XenbusStateReconfiguring : Waiting for frontend XenbusStateReconfiguring\n");
-            publish_param_int("state", XenbusStateReconfiguring);
-            frontend_state = wait_for_frontend_state_change(); /*XenbusStateReconfiguring*/
-            DPRINTF("STATE=XenbusStateReconfiguring : frontend state was %d\n", frontend_state);
-            if(frontend_state==-1)
-                goto fail; /* fail after timeout */
-        }
-
+    if(pa_sample_spec_valid(&frontss) && 
+            pa_usec_to_bytes(1000, &frontss) <= pa_usec_to_bytes(1000, &ss))
+    {
+        /* accept frontend params */
+        read_frontend_spec(&ss);
+        set_state(XenbusStateConnected);
+    }
+    else
+    {
+        /* reject; set state to reconfiguring and wait for frontend to post new parameters */
+        set_state(XenbusStateReconfiguring);
     }
 
+    return 0;
+}
 
+int state_connected_cb()
+{
+    /*TODO at this stage, we should check that the negotiation has gone through;
+     * if not, the frontend might have been restored/etc.
+     */
+    set_state(XenbusStateConnected);
+    int grant_ref;
+    DPRINTF("frontend state was XenbusStateConnected\n");
+    char *out;
+    
     /* Phase 2: negotiation ended, continue initialization */
     out = read_param("event-channel");
     remote_port = atoi(out);
@@ -186,32 +163,100 @@ int main(int argc,  char** argv)
     /* map ioring to local space */
     map_grant(frontend_domid, grant_ref, &ioring);
 
-
     /* everything OK, end of Phase 2 */
-    publish_param_int("state", XenbusStateConnected);
-    DPRINTF("STATE=XenbusStateConnected\n");
-
     /* begin playback cycle */
     for(;;){
         if(play_stream()){
             DPRINTF("Stream timed out\n");
-            //TODO: check if backend is alive, etc.
-            
-       }
-         /* block until next event */
+
+        }
+        /* block until next event */
         ring_wait_for_event();
 
         if(!frontend_is_alive()){
             DPRINTF("Frontend died, exiting\n");
-            break;
+            return 1;
         }
 
- 
+
+    }
+    return 0;
+}
+
+int state_closing_cb()
+{
+    DPRINTF("frontend state was XenbusStateClosing\n");
+    return 0;
+}
+
+int state_closed_cb()
+{
+    DPRINTF("frontend state was XenbusStateClosed\n");
+    return 0;
+}
+
+int state_reconfiguring_cb()
+{
+    DPRINTF("frontend state was XenbusStateReconfiguring\n");
+    return 0;
+}
+
+int state_reconfigured_cb()
+{
+    DPRINTF("frontend state was XenbusStateReconfigured\n");
+    return 0;
+}
+
+int (*state_callbacks[9])(void) = {
+    state_unknown_cb,
+    state_initialising_cb,
+    state_initwait_cb,
+    state_initialised_cb,
+    state_connected_cb,
+    state_closing_cb,
+    state_closed_cb,
+    state_reconfiguring_cb,
+    state_reconfigured_cb
+};
+
+
+struct xs_handle *xsh;
+int main(int argc,  char** argv)
+{
+    bool ret; /* xen error variable */
+    int frontend_state;
+
+    if(argc<2){
+        fprintf(stderr, "Usage: %s <dom_id> \n", argv[0]);
+        exit(2);
     }
 
-fail:
-    publish_param_int("state", XenbusStateClosing);
-    DPRINTF("STATE=XenbusStateClosing\n");
+    frontend_domid = atoi(argv[1]);
+
+    device_id = 0; /* hardcoded for now */
+
+    /* Basic Initialization */
+    xsh = xs_domain_open();
+    if(!xs_write(xsh, 0, "/local/domain/0/backend/audio", "", strlen(""))) {
+        perror("xs_write");
+    };
+    xci = xc_interface_open(NULL/*log to stderr*/, NULL, 0);
+    xce = xc_evtchn_open(NULL/*log to stderr*/, 0);
+    if(register_frontend_state_watch()){
+        //error
+        perror("Failed to register frontend xenstore watch!");
+    };
+
+    set_state(XenbusStateUnknown);
+
+    /* Begin State cycle */
+    while(!ret){
+        frontend_state = wait_for_frontend_state_change();
+        ret = state_callbacks[frontend_state]();
+    }
+
+    /* Cleanup */
+    set_state(XenbusStateClosing);
 
     munmap(ioring, 4096);
     xc_evtchn_close(xce);
@@ -220,7 +265,7 @@ fail:
     perror("xc_interface_close");
 
 
-    publish_param_int("state", XenbusStateClosed);
+    set_state(XenbusStateClosed);
     xs_rm(xsh, 0, "/local/domain/0/backend/audio");
     xs_daemon_close(xsh);
     return 0;
@@ -238,7 +283,8 @@ int map_grant(int frontend_id, int grant_ref, struct ring **addr) {
 
     dev_fd = open("/dev/xen/gntdev", O_RDWR);
     if(dev_fd<=0){
-        perror("");
+        perror("Could not open gntdev! Have you loaded the xen_gntdev module?");
+        return 1;
     }
 
     rv = ioctl(dev_fd, IOCTL_GNTDEV_MAP_GRANT_REF, &arg);
@@ -285,7 +331,7 @@ int ring_wait_for_event()
 
     xc_evtchn_unmask(xce, local_port);
 
-    timeout.tv_sec=10;
+    timeout.tv_sec=EVENT_TIMEOUT_SECONDS;
     timeout.tv_usec=0;
 
     ret = select(xcefd+1, &readfds, NULL, NULL, &timeout);
@@ -377,7 +423,7 @@ int register_frontend_state_watch(){
 int wait_for_frontend_state_change()
 {
     char *buf, **vec;
-    int len;
+    unsigned int len;
     int frontend_state;
     int seconds;
 
@@ -390,7 +436,7 @@ int wait_for_frontend_state_change()
     xs_fd = xs_fileno(xsh);
     start = now = time(NULL);
 
-    seconds = 30;
+    seconds = EVENT_TIMEOUT_SECONDS;
 	do {
 		tv.tv_usec = 0;
 		tv.tv_sec = (start + seconds) - now;
@@ -486,7 +532,7 @@ int frontend_is_alive()
 {
     char keybuf[128];
     char *out;
-    int len;
+    unsigned int len;
     int frontend_state;
 
     snprintf(keybuf, sizeof(keybuf), "/local/domain/%d", frontend_domid);
@@ -515,4 +561,13 @@ int frontend_is_alive()
 
     /* all OK */
     return 1;
+}
+
+int set_state(int state)
+{
+    static int current_state = 0;
+    DPRINTF("State transition %d->%d\n", current_state, state);
+    publish_param_int("state", state);
+    current_state = state;
+    return state;
 }

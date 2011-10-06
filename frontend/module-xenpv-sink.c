@@ -121,6 +121,7 @@ struct userdata {
     int write_type;
 };
 
+/* just to test non- frame-aligned size */
 #define BUFSIZE 2047
 
 struct ring {
@@ -140,19 +141,16 @@ static const char* const valid_modargs[] = {
     "channel_map",
     NULL
 };
-watch_first_time = 1;
-// Xen globals
-/*xc_evtchn_t, xc_interface */
+
+/* Xen globals*/
 xc_interface* xch;
 xc_evtchn* xce;
 evtchn_port_t xen_evtchn_port;
 static struct xs_handle *xsh;
-
 struct ioctl_gntalloc_alloc_gref gref;
 
 int alloc_gref(struct ioctl_gntalloc_alloc_gref *gref, void **addr);
 int ring_write(struct ring *r, void *src, int length);
-int ring_wait_for_event();
 int publish_spec(pa_sample_spec *ss);
 int read_spec(pa_sample_spec *ss);
 int publish_param(const char *paramname, const char *value);
@@ -298,11 +296,8 @@ int pa__init(pa_module*m) {
     pa_channel_map map;
     pa_modargs *ma;
     pa_sink_new_data data;
-    char keybuf[128];
-    char *buf;
-    unsigned int len;
-    unsigned int my_domid, num_strings;
     int backend_state;
+    char strbuf[100];
 
     pa_assert(m);
 
@@ -333,12 +328,11 @@ int pa__init(pa_module*m) {
     };
     device_id = 0; /* hardcoded for now */
 
-    my_domid = atoi(xs_read(xsh, 0, "domid", &len));
-
     if(register_backend_state_watch()){
         //error
     };
 
+    /*************** REPLACE_BY_CALLBACKS *************************/
     /* Basic initialization ended, make frontend's presence known */
     DPRINTF("STATE=XenbusStateUnknown : Waiting for backend XenbusStateUnknown\n");
     publish_param_int("state", XenbusStateUnknown);
@@ -358,9 +352,10 @@ int pa__init(pa_module*m) {
         goto fail;
     }
 
-    /* let's ask for something absurd */
+    /* let's ask for something absurd and deal with rejection */
     ss.rate = 192000;
     publish_spec(&ss);
+
     /* wait for backend to post its own parameters; this should be XenbusStateInitializing */
     DPRINTF("STATE=XenbusStateInitialising : Waiting for backend XenbusStateInitialising\n");
     publish_param_int("state", XenbusStateInitialising);
@@ -392,8 +387,8 @@ int pa__init(pa_module*m) {
             /* backend should accept these now as well*/
             publish_spec(&ss);
             /* set state to notify backend that we posted new parameters */
-            DPRINTF("STATE=XenbusStateReconfiguring : backend state was %d\n", backend_state);
-            publish_param_int("state", XenbusStateReconfiguring);
+            DPRINTF("STATE=XenbusInitialised : backend state was %d\n", backend_state);
+            publish_param_int("state", XenbusStateInitialised);
         }
         else if(backend_state==XenbusStateConnected){
             /* backend accepted our parameters, negotiation is over */
@@ -402,10 +397,11 @@ int pa__init(pa_module*m) {
             break;
         }
     }
+    /***********END REPLACE_BY_CALLBACKS *************/
 
-    char sss[100];
-    pa_sample_spec_snprint(sss, 100, &ss);
-    DPRINTF(sss);
+
+    pa_sample_spec_snprint(strbuf, 100, &ss);
+    DPRINTF(strbuf);
 
     /* End of Phase 2, begin playback cycle */
     
@@ -426,7 +422,7 @@ int pa__init(pa_module*m) {
     data.driver = __FILE__;
     data.module = m;
     pa_sink_new_data_set_name(&data, pa_modargs_get_value(ma, "sink_name", DEFAULT_SINK_NAME));
-    pa_proplist_sets(data.proplist, PA_PROP_DEVICE_STRING, "xensink");//u->filename);
+    pa_proplist_sets(data.proplist, PA_PROP_DEVICE_STRING, "xensink");
     pa_proplist_setf(data.proplist, PA_PROP_DEVICE_DESCRIPTION, "Xen PV audio sink");
     pa_sink_new_data_set_sample_spec(&data, &ss);
     pa_sink_new_data_set_channel_map(&data, &map);
@@ -448,6 +444,7 @@ int pa__init(pa_module*m) {
     u->sink->parent.process_msg = sink_process_msg;
     u->sink->userdata = u;
 
+    //TODO cleanup this stuff
     pa_sink_set_asyncmsgq(u->sink, u->thread_mq.inq);
     pa_sink_set_rtpoll(u->sink, u->rtpoll);
     //pa_sink_set_max_request(u->sink, pa_pipe_buf(u->fd));
@@ -529,7 +526,9 @@ void pa__done(pa_module*m) {
     pa_xfree(u);
 
     publish_param_int("state", XenbusStateClosing);
+    /*XXX hardcoded*/
     munmap((void*)gref.index, 4096);
+
     //close xen interfaces
     xc_evtchn_close(xce);
     xc_interface_close(xch);
@@ -545,8 +544,18 @@ void pa__done(pa_module*m) {
 int alloc_gref(struct ioctl_gntalloc_alloc_gref *gref, void **addr)
 {
     int alloc_fd, dev_fd, rv;
+
     alloc_fd = open("/dev/xen/gntalloc", O_RDWR);
+    if(alloc_fd<=0){
+        perror("Could not open gntalloc! Have you loaded the xen_gntalloc module?");
+        return 1;
+    }
+
     dev_fd = open("/dev/xen/gntdev", O_RDWR);
+    if(dev_fd<=0){
+        perror("Could not open gntdev! Have you loaded the xen_gntdev module?");
+        return 1;
+    }
 
     /*use dom0*/
     gref->domid = 0;
@@ -559,7 +568,7 @@ int alloc_gref(struct ioctl_gntalloc_alloc_gref *gref, void **addr)
         return rv;
     }
 
-    /*addr=NULL(default),length, prot,             flags,    fd,   offset*/
+    /*addr=NULL(default),length, prot,             flags,    fd,         offset*/
     *addr = mmap(0, 4096, PROT_READ|PROT_WRITE, MAP_SHARED, alloc_fd, gref->index);
     if (*addr == MAP_FAILED) {
         *addr = 0;
@@ -587,10 +596,11 @@ int alloc_gref(struct ioctl_gntalloc_alloc_gref *gref, void **addr)
     return rv;
 }
 
+/* don't judge me by my macros */
+#define RING_FREE_BYTES ((r->usable_buffer_space - (r->prod_indx-r->cons_indx) -1) % r->usable_buffer_space)
+//#define RING_FREE_BYTES ((sizeof(r->buffer) - (r->prod_indx-r->cons_indx) -1) % sizeof(r->buffer))
 int ring_write(struct ring *r, void *src, int length)
 {
-//#define RING_FREE_BYTES ((sizeof(r->buffer) - (r->prod_indx-r->cons_indx) -1) % sizeof(r->buffer))
-#define RING_FREE_BYTES ((r->usable_buffer_space - (r->prod_indx-r->cons_indx) -1) % r->usable_buffer_space)
     int full = 0;
     for(;;){
         //free space may be split over the end of the buffer
@@ -601,11 +611,12 @@ int ring_write(struct ring *r, void *src, int length)
 
         //full?
         if(RING_FREE_BYTES==0) {
+            /*XXX hardcoded*/
             if(full>=100){
                 errno = EINTR;
                 return -1;
             }
-            /*TODO: use less arbitrary timeout */
+            /*XXX use less arbitrary timeout */
             usleep(1000);
             //should return in 100ms max; definitely not midstream
             full++;
@@ -617,51 +628,16 @@ int ring_write(struct ring *r, void *src, int length)
         fl = PA_MIN(l, first_chunk_size);
         sl = PA_MIN(l-fl, second_chunk_size);
 
-        //copy to both chunks
+        //TODO update these debugging messages
         //DPRINTF("XEN: Copying chunks: bufsize:%d prod_indx:%d consindx:%d, free:%d, total:%d\n", sizeof(r->buffer), r->prod_indx, r->cons_indx, ring_free_bytes, total_bytes);
         //DPRINTF("XEN: Copying chunks: l%d fl:%d sl%d length:%d\n",l,fl,sl,length);
         memcpy(r->buffer+r->prod_indx, src, fl);
         if(sl)
             memcpy(r->buffer, src+fl, sl);
-        //r->prod_indx = (r->prod_indx+fl+sl) % sizeof(r->buffer);
         r->prod_indx = (r->prod_indx+fl+sl) % r->usable_buffer_space;
 
         return sl+fl;
     }
-}
-
-int ring_wait_for_event()
-{
-    //puts("XEN:Blocking");
-    //fflush(stdout);
-	fd_set readfds;
-	int xcefd, ret;
-	struct timeval timeout;
-
-	xcefd = xc_evtchn_fd(xce);
-	FD_ZERO(&readfds);
-	FD_SET(xcefd, &readfds);
-
-	xc_evtchn_unmask(xce, xen_evtchn_port);
-
-	timeout.tv_sec=1000;
-	timeout.tv_usec=0;
-
-	ret = select(xcefd+1, &readfds, NULL, NULL, &timeout);
-        xc_evtchn_pending(xce);
-
-	if(ret==-1) {
-            perror("select() returned error while waiting for backend");
-            return ret;
-        }
-	else if(ret && FD_ISSET(xcefd, &readfds)){
-            return EAGAIN; //OK
-        }
-
-	else{
-            perror("select() timed out while waiting for backend\n");
-            return 0;
-        }
 }
 
 int publish_param(const char *paramname, const char *value)
@@ -728,7 +704,8 @@ int read_spec(pa_sample_spec *ss){
 
 int register_backend_state_watch(){
     char keybuf[128];
-    int my_domid, len;
+    int my_domid;
+    unsigned int len;
 
     my_domid = atoi(xs_read(xsh, 0, "domid", &len));
     snprintf(keybuf, sizeof(keybuf), "/local/domain/0/backend/audio/%d/%d/state", my_domid, device_id);
@@ -742,7 +719,8 @@ int register_backend_state_watch(){
 int wait_for_backend_state_change()
 {
     char keybuf[128];
-    int my_domid, len;
+    int my_domid;
+    unsigned int len;
 
     int backend_state;
     int seconds;
