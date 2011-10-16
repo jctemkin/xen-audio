@@ -67,10 +67,12 @@ PA_MODULE_USAGE(
 #define DEFAULT_SINK_NAME "xenpv_output"
 #define DEFAULT_FILE_NAME "xenpv_output"
 
+#define STATE_UNDEFINED 9999
+
 #define DEBUG 1
 
 #if DEBUG
-#define DPRINTF(_f, _a...) printf ( _f , ## _a )
+#define DPRINTF(_f, _a...) pa_log_debug( _f , ## _a )
 #else
 #define DPRINTF(_f, _a...) ((void)0)
 #endif
@@ -81,24 +83,25 @@ enum xenbus_state
 {
 	XenbusStateUnknown      = 0,
 	XenbusStateInitialising = 1,
-	XenbusStateInitWait     = 2,  /* Finished early
-					 initialisation, but waiting
-					 for information from the peer
-					 or hotplug scripts. */
-	XenbusStateInitialised  = 3,  /* Initialised and waiting for a
-					 connection from the peer. */
+	XenbusStateInitWait     = 2, 
+	XenbusStateInitialised  = 3,  
 	XenbusStateConnected    = 4,
-	XenbusStateClosing      = 5,  /* The device is being closed
-					 due to an error or an unplug
-					 event. */
+	XenbusStateClosing      = 5,  
 	XenbusStateClosed       = 6,
-
-	/*
-	* Reconfiguring: The device is being reconfigured.
-	*/
 	XenbusStateReconfiguring = 7,
-
 	XenbusStateReconfigured  = 8
+};
+
+static char* xenbus_names[] = {
+    "XenbusStateUnknown",
+    "XenbusStateInitialising",
+    "XenbusStateInitWait",
+    "XenbusStateInitialised",
+    "XenbusStateConnected",
+    "XenbusStateClosing",
+    "XenbusStateClosed",
+    "XenbusStateReconfiguring",
+    "XenbusStateReconfigured"
 };
 
 struct userdata {
@@ -111,8 +114,6 @@ struct userdata {
     pa_rtpoll *rtpoll;
 
 //modify for xen event channel fd & grant
-    char *filename;
-    int fd;
 //
     pa_memchunk memchunk;
 
@@ -120,6 +121,9 @@ struct userdata {
 
     int write_type;
 };
+
+pa_sample_spec ss;
+pa_channel_map map;
 
 /* just to test non- frame-aligned size */
 #define BUFSIZE 2047
@@ -152,13 +156,126 @@ struct ioctl_gntalloc_alloc_gref gref;
 int alloc_gref(struct ioctl_gntalloc_alloc_gref *gref, void **addr);
 int ring_write(struct ring *r, void *src, int length);
 int publish_spec(pa_sample_spec *ss);
-int read_spec(pa_sample_spec *ss);
+int read_backend_default_spec(pa_sample_spec *ss);
 int publish_param(const char *paramname, const char *value);
 int publish_param_int(const char *paramname, const int value);
 char* read_param(char *paramname);
 
 int register_backend_state_watch();
 int wait_for_backend_state_change();
+
+int set_state(int state)
+{
+    static int current_state = 0;
+    DPRINTF("State transition %s->%s\n",
+            xenbus_names[current_state], xenbus_names[state]); 
+
+    publish_param_int("state", state);
+    current_state = state;
+    return state;
+}
+#define NEGOTIATION_ERROR 2
+#define NEGOTIATION_OK 1
+
+/* negotiation callbacks */
+int state_unknown_cb()
+{
+    DPRINTF("Xen audio sink: Backend state was XenbusStateUnknown\n");
+    set_state(XenbusStateInitialising);
+
+    return 0;
+}
+
+int state_initialising_cb()
+{
+    DPRINTF("Xen audio sink: Backend state was XenbusStateInitialising\n");
+    set_state(XenbusStateInitialised);
+    return 0;
+}
+
+int state_initwait_cb()
+{
+    DPRINTF("Xen audio sink: Backend state was XenbusStateInitWait\n");
+    return 0;
+}
+
+int state_initialised_cb()
+{
+    DPRINTF("Xen audio sink: Backend state was XenbusStateInitialised\n");
+    /*Remind the backend we are ready*/
+    set_state(XenbusStateInitialised);
+    return 0;
+}
+
+int state_connected_cb()
+{
+    /* The backend accepted our parameters, sweet! */
+    set_state(XenbusStateConnected);
+    DPRINTF("Xen audio sink: Backend state was XenbusStateConnected\n");
+    return NEGOTIATION_OK;
+}
+
+int state_closing_cb()
+{
+    DPRINTF("Xen audio sink: Backend state was XenbusStateClosing\n");
+    return 0;
+}
+
+int state_closed_cb()
+{
+    DPRINTF("Xen audio sink: Backend state was XenbusStateClosed\n");
+    return 0;
+}
+
+int state_reconfiguring_cb()
+{
+    /* The backend rejected our sample spec */
+    DPRINTF("Xen audio sink: Backend state was XenbusStateReconfiguring\n");
+    /* fall back to the backend's default parameters*/
+    read_backend_default_spec(&ss);
+    /* backend should accept these now */
+    publish_spec(&ss);  
+    set_state(XenbusStateInitialised);
+    return 0;
+}
+
+int state_reconfigured_cb()
+{
+    DPRINTF("Xen audio sink: Backend state was XenbusStateReconfigured\n");
+    return 0;
+}
+
+int (*state_callbacks[9])(void) = {
+    state_unknown_cb,
+    state_initialising_cb,
+    state_initwait_cb,
+    state_initialised_cb,
+    state_connected_cb,
+    state_closing_cb,
+    state_closed_cb,
+    state_reconfiguring_cb,
+    state_reconfigured_cb
+};
+
+void xen_cleanup()
+{
+    char keybuf[64];
+    /*XXX hardcoded*/
+    munmap((void*)gref.index, 4096);
+
+    set_state(XenbusStateClosing);
+    /* send one last event to unblock the backend */
+    xc_evtchn_notify(xce, xen_evtchn_port);
+    //close xen interfaces
+    xc_evtchn_close(xce);
+    xc_interface_close(xch);
+    
+    //delete xenstore keys
+    publish_param_int("state", XenbusStateClosed);
+    snprintf(keybuf, sizeof(keybuf), "device/audio/%d", device_id);
+    xs_rm(xsh, 0, keybuf);
+    xs_daemon_close(xsh);
+}
 
 static int sink_process_msg(pa_msgobject *o, int code, void *data, int64_t offset, pa_memchunk *chunk) {
     struct userdata *u = PA_SINK(o)->userdata;
@@ -167,12 +284,6 @@ static int sink_process_msg(pa_msgobject *o, int code, void *data, int64_t offse
 
         case PA_SINK_MESSAGE_GET_LATENCY: {
             size_t n = 0;
-            int l;
-
-#ifdef FIONREAD
-            if (ioctl(u->fd, FIONREAD, &l) >= 0 && l > 0)
-                n = (size_t) l;
-#endif
 
             n += u->memchunk.length;
 
@@ -187,11 +298,14 @@ static int sink_process_msg(pa_msgobject *o, int code, void *data, int64_t offse
 static int process_render(struct userdata *u) {
     pa_assert(u);
 
+    
     if (u->memchunk.length <= 0)
-        pa_sink_render(u->sink, pa_pipe_buf(u->fd), &u->memchunk);
+        pa_sink_render(u->sink, ioring->usable_buffer_space, &u->memchunk);
+        
 
     pa_assert(u->memchunk.length > 0);
 
+    xc_evtchn_notify(xce, xen_evtchn_port);
     for (;;) {
         ssize_t l;
         void *p;
@@ -199,15 +313,12 @@ static int process_render(struct userdata *u) {
         p = pa_memblock_acquire(u->memchunk.memblock);
 	    //xen: write data to ring buffer & notify backend
         l = ring_write(ioring, (uint8_t*)p + u->memchunk.index, u->memchunk.length);
-        /* TODO: limit events to process_render calls? */
-        xc_evtchn_notify(xce, xen_evtchn_port);
 
         pa_memblock_release(u->memchunk.memblock);
 
         pa_assert(l != 0);
 
         if (l < 0) {
-
             if (errno == EINTR)
                 continue;
             else if (errno == EAGAIN)
@@ -284,7 +395,8 @@ fail:
      * processing messages until we received PA_MESSAGE_SHUTDOWN */
     pa_asyncmsgq_post(u->thread_mq.outq, PA_MSGOBJECT(u->core), PA_CORE_MESSAGE_UNLOAD_MODULE, u->module, 0, NULL, NULL);
     pa_asyncmsgq_wait_for(u->thread_mq.inq, PA_MESSAGE_SHUTDOWN);
-
+    pa_log_debug("Shutting down Xen...");
+    xen_cleanup();
 finish:
     pa_log_debug("Thread shutting down");
 }
@@ -292,11 +404,10 @@ finish:
 int pa__init(pa_module*m) {
 
     struct userdata *u;
-    pa_sample_spec ss;
-    pa_channel_map map;
     pa_modargs *ma;
     pa_sink_new_data data;
     int backend_state;
+    int ret;
     char strbuf[100];
 
     pa_assert(m);
@@ -306,9 +417,19 @@ int pa__init(pa_module*m) {
         goto fail;
     }
 
+    ss = m->core->default_sample_spec;
+    map = m->core->default_channel_map;
+
+    /* user arguments override these */
+    if (pa_modargs_get_sample_spec_and_channel_map(ma, &ss, &map, PA_CHANNEL_MAP_DEFAULT) < 0) {
+        pa_log("Invalid sample format specification or channel map");
+        return 1;
+    }
+
     /* Xen Basic init */
     xsh = xs_domain_open();
     if(xsh==NULL){ pa_log("xs_domain_open failed"); goto fail; }
+    set_state(XenbusStateUnknown);
 
     xch = xc_interface_open(NULL, NULL, 0);
     if(xch==0){ pa_log("xc_interface_open failed"); goto fail; }
@@ -332,76 +453,34 @@ int pa__init(pa_module*m) {
         //error
     };
 
-    /*************** REPLACE_BY_CALLBACKS *************************/
-    /* Basic initialization ended, make frontend's presence known */
-    DPRINTF("STATE=XenbusStateUnknown : Waiting for backend XenbusStateUnknown\n");
-    publish_param_int("state", XenbusStateUnknown);
-    /* wait for backend to appear */
-
-    backend_state = wait_for_backend_state_change();/*XenbusStateUnknown*/
-    DPRINTF("STATE=XenbusStateUnknown : backend state was %d\n", backend_state);
-    /* Begin Phase 1 */
-    //post event chan & grant reference to xenstore
     publish_param_int("event-channel", xen_evtchn_port);
     publish_param_int("ring-ref", gref.gref_ids[0]);
 
-    ss = m->core->default_sample_spec;
-    map = m->core->default_channel_map;
-    if (pa_modargs_get_sample_spec_and_channel_map(ma, &ss, &map, PA_CHANNEL_MAP_DEFAULT) < 0) {
-        pa_log("Invalid sample format specification or channel map");
-        goto fail;
-    }
-
     /* let's ask for something absurd and deal with rejection */
     ss.rate = 192000;
+
     publish_spec(&ss);
 
-    /* wait for backend to post its own parameters; this should be XenbusStateInitializing */
-    DPRINTF("STATE=XenbusStateInitialising : Waiting for backend XenbusStateInitialising\n");
-    publish_param_int("state", XenbusStateInitialising);
-    backend_state = wait_for_backend_state_change();
-    DPRINTF("STATE=XenbusStateInitialising : backend state was %d\n", backend_state);
-
-    /* Begin Phase 2 */
-    DPRINTF("STATE=XenbusStateInitialised : Waiting for backend response (connected=4 or reconfiguring=7)\n");
-    publish_param_int("state", XenbusStateInitialised);   
-
-    backend_state = 0;
-    while(backend_state!=XenbusStateInitialised)
-    {
-        /* remind the backend that we are ready */
-        publish_param_int("state", XenbusStateInitialised);   
-        backend_state = wait_for_backend_state_change(); /*XenbusStateInitialising; discard*/
-        if(backend_state==-1)
-            goto fail; /* fail after timeout */
-    }
-
-    backend_state = 0;
-    while(backend_state!=-1) {
+    ret=0;
+    while(!ret){
         backend_state = wait_for_backend_state_change();
-        DPRINTF("STATE=XenbusStateInitialised : backend state was %d\n", backend_state);
-
-        if(backend_state==XenbusStateReconfiguring){
-            /* simple fallback; accept backend's parameters */
-            read_spec(&ss);
-            /* backend should accept these now as well*/
-            publish_spec(&ss);
-            /* set state to notify backend that we posted new parameters */
-            DPRINTF("STATE=XenbusInitialised : backend state was %d\n", backend_state);
-            publish_param_int("state", XenbusStateInitialised);
-        }
-        else if(backend_state==XenbusStateConnected){
-            /* backend accepted our parameters, negotiation is over */
-            publish_param_int("state", XenbusStateConnected);
-            DPRINTF("STATE=XenbusStateConnected : backend state was %d\n", backend_state);
+        if(backend_state == STATE_UNDEFINED){
+            pa_log("Xen Backend is taking long to respond, still waiting...");
+            continue;
+        } else if(backend_state == -1) {
+            pa_log("Error while waiting for backend: %s", strerror(errno));
             break;
+            goto fail;
         }
+        ret = state_callbacks[backend_state]();
     }
-    /***********END REPLACE_BY_CALLBACKS *************/
-
+    if(ret!=NEGOTIATION_OK){
+        pa_log("Negotiation with Xen backend failed!");
+        return 1;
+    }
 
     pa_sample_spec_snprint(strbuf, 100, &ss);
-    DPRINTF(strbuf);
+    DPRINTF("Negotiation ended, the result was: %s", strbuf);
 
     /* End of Phase 2, begin playback cycle */
     
@@ -447,13 +526,10 @@ int pa__init(pa_module*m) {
     //TODO cleanup this stuff
     pa_sink_set_asyncmsgq(u->sink, u->thread_mq.inq);
     pa_sink_set_rtpoll(u->sink, u->rtpoll);
-    //pa_sink_set_max_request(u->sink, pa_pipe_buf(u->fd));
-    //pa_sink_set_fixed_latency(u->sink, pa_bytes_to_usec(pa_pipe_buf(u->fd), &u->sink->sample_spec));
+    pa_sink_set_max_request(u->sink, ioring->usable_buffer_space);
+    pa_sink_set_fixed_latency(u->sink, pa_bytes_to_usec(ioring->usable_buffer_space, &u->sink->sample_spec));
 
     u->rtpoll_item = pa_rtpoll_item_new(u->rtpoll, PA_RTPOLL_NEVER, 1);
-    //pollfd = pa_rtpoll_item_get_pollfd(u->rtpoll_item, NULL);
-    //pollfd->fd = u->fd;
-    //pollfd->events = pollfd->revents = 0;
 
     if (!(u->thread = pa_thread_new(thread_func, u))) {
         pa_log("Failed to create thread.");
@@ -486,7 +562,6 @@ int pa__get_n_used(pa_module *m) {
 
 void pa__done(pa_module*m) {
     struct userdata *u;
-    char keybuf[64];
 
     pa_assert(m);
 
@@ -515,29 +590,10 @@ void pa__done(pa_module*m) {
     if (u->rtpoll)
         pa_rtpoll_free(u->rtpoll);
 
-    if (u->filename) {
-        unlink(u->filename);
-        pa_xfree(u->filename);
-    }
-
-    if (u->fd >= 0)
-        pa_assert_se(pa_close(u->fd) == 0);
-
     pa_xfree(u);
-
-    publish_param_int("state", XenbusStateClosing);
-    /*XXX hardcoded*/
-    munmap((void*)gref.index, 4096);
-
-    //close xen interfaces
-    xc_evtchn_close(xce);
-    xc_interface_close(xch);
     
-    //delete xenstore keys
-    publish_param_int("state", XenbusStateClosed);
-    snprintf(keybuf, sizeof(keybuf), "device/audio/%d", device_id);
-    xs_rm(xsh, 0, keybuf);
-    xs_daemon_close(xsh);
+    xen_cleanup();
+
 }
 
 
@@ -564,7 +620,7 @@ int alloc_gref(struct ioctl_gntalloc_alloc_gref *gref, void **addr)
 
     rv = ioctl(alloc_fd, IOCTL_GNTALLOC_ALLOC_GREF, gref);
     if (rv) {
-        DPRINTF("src-add error: %s (rv=%d)\n", strerror(errno), rv);
+        DPRINTF("Xen audio sink: src-add error: %s (rv=%d)\n", strerror(errno), rv);
         return rv;
     }
 
@@ -572,11 +628,11 @@ int alloc_gref(struct ioctl_gntalloc_alloc_gref *gref, void **addr)
     *addr = mmap(0, 4096, PROT_READ|PROT_WRITE, MAP_SHARED, alloc_fd, gref->index);
     if (*addr == MAP_FAILED) {
         *addr = 0;
-        DPRINTF("mmap failed: SHOULD NOT HAPPEN\n");
+        DPRINTF("Xen audio sink: mmap failed: SHOULD NOT HAPPEN\n");
         return rv;
     }
 
-    DPRINTF("Got grant #%d. Mapped locally at %Ld=%p\n",
+    DPRINTF("Xen audio sink: Got grant #%d. Mapped locally at %Ld=%p\n",
             gref->gref_ids[0], (long long)gref->index, *addr);
 
     /* skip this for now
@@ -678,12 +734,11 @@ int publish_spec(pa_sample_spec *ss){
     ret += publish_param_int("rate", ss->rate);
     ret += publish_param_int("channels", ss->channels);
 
-    ret += publish_param_int("state", XenbusStateInitWait);
     return ret;
 }
 
 
-int read_spec(pa_sample_spec *ss){
+int read_backend_default_spec(pa_sample_spec *ss){
     /*Read spec from backend*/
     char *out;
 
@@ -725,13 +780,14 @@ int wait_for_backend_state_change()
     int backend_state;
     int seconds;
     char *buf, **vec;
+    int ret;
 
     int xs_fd;
     struct timeval tv;
 	fd_set watch_fdset;
     int start, now;
 
-    backend_state = -1;
+    backend_state = STATE_UNDEFINED;
     xs_fd = xs_fileno(xsh);
     start = now = time(NULL);
 
@@ -744,7 +800,13 @@ int wait_for_backend_state_change()
 		tv.tv_sec = (start + seconds) - now;
 		FD_ZERO(&watch_fdset);
 		FD_SET(xs_fd, &watch_fdset);
-		if (select(xs_fd + 1, &watch_fdset, NULL, NULL, &tv)) {
+        ret=select(xs_fd + 1, &watch_fdset, NULL, NULL, &tv);
+
+        if(ret==-1)
+            /* error */
+            return -1;
+        else if(ret) {
+
 			/* Read the watch to drain the buffer */
 			vec = xs_read_watch(xsh, &len);
 
@@ -758,7 +820,8 @@ int wait_for_backend_state_change()
             free(buf); 
             free(vec);
 		}
-	} while (backend_state == -1 && (now = time(NULL)) < start + seconds);
+        /* else: timeout */
+	} while (backend_state == STATE_UNDEFINED && (now = time(NULL)) < start + seconds);
 
     return backend_state;
 }
